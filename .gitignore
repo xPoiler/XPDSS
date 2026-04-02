@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.claude/
+debug_cameras.txt
+my_config.json
