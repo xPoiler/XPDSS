@@ -399,6 +399,57 @@ class UpmixerWindow(QMainWindow):
         self.btn_ind.toggled.connect(self.toggle_independent)
         right_panel.addWidget(self.btn_ind)
 
+        # ── Adaptive Renderer Controls ──
+        right_panel.addWidget(_make_section_label("ADAPTIVE RENDERER"))
+        adaptive_mode_layout = QHBoxLayout()
+        adaptive_mode_layout.setSpacing(5)
+        self.adaptive_mode_group = QButtonGroup(self)
+        self.btn_adapt_observe = QPushButton("OBSERVE")
+        self.btn_adapt_assist = QPushButton("ASSIST")
+        self.btn_adapt_full = QPushButton("FULL")
+        for btn in (self.btn_adapt_observe, self.btn_adapt_assist, self.btn_adapt_full):
+            btn.setCheckable(True)
+            btn.setStyleSheet(btn_sm)
+            adaptive_mode_layout.addWidget(btn)
+            self.adaptive_mode_group.addButton(btn)
+        self.btn_adapt_observe.clicked.connect(lambda: self.set_adaptive_mode("observe"))
+        self.btn_adapt_assist.clicked.connect(lambda: self.set_adaptive_mode("assist"))
+        self.btn_adapt_full.clicked.connect(lambda: self.set_adaptive_mode("full"))
+        right_panel.addLayout(adaptive_mode_layout)
+
+        adaptive_profile_layout = QGridLayout()
+        adaptive_profile_layout.setSpacing(4)
+        self.adaptive_profile_group = QButtonGroup(self)
+        self.btn_profile_neutral = QPushButton("NEUTRAL")
+        self.btn_profile_cinema = QPushButton("CINEMA")
+        self.btn_profile_music = QPushButton("MUSIC")
+        self.btn_profile_night = QPushButton("NIGHT")
+        profile_buttons = [
+            (self.btn_profile_neutral, "neutral"),
+            (self.btn_profile_cinema, "cinema"),
+            (self.btn_profile_music, "music"),
+            (self.btn_profile_night, "night"),
+        ]
+        for i, (btn, profile_name) in enumerate(profile_buttons):
+            btn.setCheckable(True)
+            btn.setStyleSheet(btn_sm)
+            btn.clicked.connect(lambda _=False, p=profile_name: self.set_adaptive_profile(p))
+            self.adaptive_profile_group.addButton(btn)
+            adaptive_profile_layout.addWidget(btn, i // 2, i % 2)
+        right_panel.addLayout(adaptive_profile_layout)
+
+        self.btn_adaptive_compare = QPushButton("A/B STATIC REFERENCE")
+        self.btn_adaptive_compare.setCheckable(True)
+        self.btn_adaptive_compare.setStyleSheet(btn_sm)
+        self.btn_adaptive_compare.toggled.connect(self.toggle_adaptive_compare)
+        right_panel.addWidget(self.btn_adaptive_compare)
+
+        self.lbl_adaptive = QLabel("Adaptive telemetry offline")
+        self.lbl_adaptive.setWordWrap(True)
+        self.lbl_adaptive.setStyleSheet("color: #66d9ef; font-family: monospace; font-size: 10px; background: #101820; border: 1px solid #223344; padding: 8px;")
+        right_panel.addWidget(self.lbl_adaptive)
+        self.refresh_adaptive_ui()
+
         # ══════════════════════════════════════════════════════════════
         #  GROUPED TOGGLE BUTTONS (2-column grid per section)
         # ══════════════════════════════════════════════════════════════
@@ -415,6 +466,7 @@ class UpmixerWindow(QMainWindow):
             ]),
             ("AUDIO ENHANCE", [
                 ("DYNAMIC EQ", "dynamic_eq", "Fletcher-Munson loudness compensation."),
+                ("DIALOG FOCUS", "dialogue_focus", "Adaptive speech-presence emphasis for center/dialogue."),
                 ("VOCAL LOCK", "vocal_lock", "Detect vocals and boost center clarity."),
                 ("TILT CORRECT", "spectral_tilt", "Auto-correct spectral tilt toward warm target."),
                 ("BASS EXCITER", "harmonic_exciter", "Psychoacoustic bass harmonics for small speakers."),
@@ -549,13 +601,8 @@ class UpmixerWindow(QMainWindow):
         self.btn_export.setStyleSheet(btn_style + "padding: 8px;")
         self.btn_export.clicked.connect(self.export_config)
 
-        self.btn_calibrate = QPushButton("CALIBRATE BINAURAL")
-        self.btn_calibrate.setStyleSheet(btn_style + "padding: 8px; background: #003322; color: #00ffaa; border: 1px solid #00ffaa;")
-        self.btn_calibrate.clicked.connect(self.start_calibration)
-
         config_layout.addWidget(self.btn_import)
         config_layout.addWidget(self.btn_export)
-        config_layout.addWidget(self.btn_calibrate)
         right_panel.addLayout(config_layout)
 
         right_panel.addStretch()
@@ -594,6 +641,11 @@ class UpmixerWindow(QMainWindow):
         self.combo_out = QComboBox()
         self.combo_out.setStyleSheet("QComboBox { background: #222; color: #00e5ff; padding: 5px; border: 1px solid #444; }")
 
+        lbl_secondary = QLabel("BASS SHAKER OUTPUT (WASAPI)")
+        lbl_secondary.setStyleSheet("color: #aaa; font-weight: bold;")
+        self.combo_secondary_out = QComboBox()
+        self.combo_secondary_out.setStyleSheet("QComboBox { background: #222; color: #00e5ff; padding: 5px; border: 1px solid #444; }")
+
         lbl_cam = QLabel("WEBCAM DEVICE (3D TRACKING)")
         lbl_cam.setStyleSheet("color: #aaa; font-weight: bold;")
         self.combo_cam = QComboBox()
@@ -607,15 +659,71 @@ class UpmixerWindow(QMainWindow):
         setup_layout.addWidget(self.combo_in)
         setup_layout.addWidget(lbl_out)
         setup_layout.addWidget(self.combo_out)
+        setup_layout.addWidget(lbl_secondary)
+        setup_layout.addWidget(self.combo_secondary_out)
         setup_layout.addWidget(lbl_cam)
         setup_layout.addWidget(self.combo_cam)
         setup_layout.addWidget(self.btn_apply_dev)
         setup_layout.addStretch()
 
         self.tabs.addTab(tab_setup, "DEVICE SETUP")
+
+        # ═══════════════════════════════════════════════════════════════════
+        #  TAB 3: BASS SHAKER
+        # ═══════════════════════════════════════════════════════════════════
+        tab_secondary = QWidget()
+        secondary_layout = QVBoxLayout(tab_secondary)
+        secondary_layout.setSpacing(14)
+        secondary_layout.setContentsMargins(40, 40, 40, 40)
+
+        self.btn_secondary_enable = QPushButton("BASS SHAKER OUTPUT")
+        self.btn_secondary_enable.setCheckable(True)
+        self.btn_secondary_enable.setStyleSheet(btn_style + "padding: 10px;")
+        self.btn_secondary_enable.toggled.connect(self.toggle_secondary_output)
+        secondary_layout.addWidget(self.btn_secondary_enable)
+
+        source_row = QHBoxLayout()
+        source_lbl = QLabel("SOURCE")
+        source_lbl.setStyleSheet("color: #aaa; font-weight: bold;")
+        self.combo_secondary_source = QComboBox()
+        self.combo_secondary_source.setStyleSheet("QComboBox { background: #222; color: #00e5ff; padding: 5px; border: 1px solid #444; }")
+        self.combo_secondary_source.addItem("LFE OR BASS MIX", "lfe_or_bass_mix")
+        self.combo_secondary_source.addItem("FRONT BASS MIX", "front_bass_mix")
+        self.combo_secondary_source.currentIndexChanged.connect(self.on_secondary_source_changed)
+        source_row.addWidget(source_lbl)
+        source_row.addWidget(self.combo_secondary_source, 1)
+        secondary_layout.addLayout(source_row)
+
+        self.btn_secondary_mono = QPushButton("MONO SUM")
+        self.btn_secondary_mono.setCheckable(True)
+        self.btn_secondary_mono.setStyleSheet(btn_style.replace("padding: 12px;", "padding: 8px;"))
+        self.btn_secondary_mono.toggled.connect(self.toggle_secondary_mono_sum)
+        secondary_layout.addWidget(self.btn_secondary_mono)
+
+        self.sld_secondary_gain = LabeledSlider("Gain", -18.0, 12.0, getattr(self.audio_app, 'secondary_output_gain_db', 0.0), " dB")
+        self.sld_secondary_lowpass = LabeledSlider("Low-pass", 35.0, 120.0, getattr(self.audio_app, 'secondary_output_lowpass_hz', 80.0), " Hz")
+        self.sld_secondary_highpass = LabeledSlider("High-pass", 5.0, 40.0, getattr(self.audio_app, 'secondary_output_highpass_hz', 20.0), " Hz")
+        self.sld_secondary_delay = LabeledSlider("Delay", 0.0, 80.0, getattr(self.audio_app, 'secondary_output_delay_ms', 0.0), " ms")
+        self.sld_secondary_gain.valueChanged.connect(lambda val: self.on_secondary_slider_changed('secondary_output_gain_db', val))
+        self.sld_secondary_lowpass.valueChanged.connect(lambda val: self.on_secondary_slider_changed('secondary_output_lowpass_hz', val))
+        self.sld_secondary_highpass.valueChanged.connect(lambda val: self.on_secondary_slider_changed('secondary_output_highpass_hz', val))
+        self.sld_secondary_delay.valueChanged.connect(lambda val: self.on_secondary_slider_changed('secondary_output_delay_ms', val))
+        secondary_layout.addWidget(self.sld_secondary_gain)
+        secondary_layout.addWidget(self.sld_secondary_lowpass)
+        secondary_layout.addWidget(self.sld_secondary_highpass)
+        secondary_layout.addWidget(self.sld_secondary_delay)
+
+        self.lbl_secondary_status = QLabel("Bass shaker bus follows the main XPDSS render and feeds a dedicated output stream.")
+        self.lbl_secondary_status.setWordWrap(True)
+        self.lbl_secondary_status.setStyleSheet("color: #66d9ef; font-size: 10px; background: #101820; border: 1px solid #223344; padding: 8px;")
+        secondary_layout.addWidget(self.lbl_secondary_status)
+        secondary_layout.addStretch()
+
+        self.tabs.addTab(tab_secondary, "BASS SHAKER")
         self.refresh_devices()
 
         # Initial state sync
+        self.sync_ui_from_backend()
         self.radar.puck_pos = QPointF(self.audio_app.gui_panning_x, self.audio_app.gui_panning_y)
         self.radar.set_independent_panning(self.audio_app.independent_panning)
         self.btn_ind.setChecked(self.audio_app.independent_panning)
@@ -674,6 +782,75 @@ class UpmixerWindow(QMainWindow):
         self.radar.set_independent_panning(checked)
         self.audio_app.save_config()
 
+    def set_adaptive_mode(self, mode):
+        self.audio_app.adaptive_mode = mode
+        self.audio_app.adaptive_monitor_enabled = True
+        self.audio_app.adaptive_observe_only = (mode == 'observe')
+        self.audio_app.save_config()
+        self.refresh_adaptive_ui()
+
+    def set_adaptive_profile(self, profile_name):
+        self.audio_app.adaptive_profile = profile_name
+        self.audio_app.save_config()
+        self.refresh_adaptive_ui()
+
+    def toggle_adaptive_compare(self, checked):
+        self.audio_app.adaptive_compare_bypass = checked
+        self.audio_app.save_config()
+        self.refresh_adaptive_ui()
+
+    def toggle_secondary_output(self, checked):
+        self.audio_app.set_secondary_output_enabled(checked)
+        self.update_slider_states()
+
+    def toggle_secondary_mono_sum(self, checked):
+        self.audio_app.secondary_output_mono_sum = checked
+        self.audio_app.save_config()
+        self.audio_app.refresh_secondary_output_stream()
+        self.update_slider_states()
+
+    def on_secondary_source_changed(self, _index):
+        self.audio_app.secondary_output_source_mode = self.combo_secondary_source.currentData()
+        self.audio_app.save_config()
+
+    def on_secondary_slider_changed(self, attr, value):
+        setattr(self.audio_app, attr, value)
+        if attr in ('secondary_output_lowpass_hz', 'secondary_output_highpass_hz'):
+            self.audio_app.refresh_secondary_output_filters()
+        self.audio_app.save_config()
+
+    def refresh_adaptive_ui(self):
+        mode = getattr(self.audio_app, 'adaptive_mode', 'observe')
+        profile = getattr(self.audio_app, 'adaptive_profile', 'neutral')
+        compare = getattr(self.audio_app, 'adaptive_compare_bypass', False)
+        mode_buttons = {
+            'observe': getattr(self, 'btn_adapt_observe', None),
+            'assist': getattr(self, 'btn_adapt_assist', None),
+            'full': getattr(self, 'btn_adapt_full', None),
+        }
+        for key, btn in mode_buttons.items():
+            if btn:
+                btn.blockSignals(True)
+                btn.setChecked(key == mode)
+                btn.blockSignals(False)
+
+        profile_buttons = {
+            'neutral': getattr(self, 'btn_profile_neutral', None),
+            'cinema': getattr(self, 'btn_profile_cinema', None),
+            'music': getattr(self, 'btn_profile_music', None),
+            'night': getattr(self, 'btn_profile_night', None),
+        }
+        for key, btn in profile_buttons.items():
+            if btn:
+                btn.blockSignals(True)
+                btn.setChecked(key == profile)
+                btn.blockSignals(False)
+
+        if hasattr(self, 'btn_adaptive_compare'):
+            self.btn_adaptive_compare.blockSignals(True)
+            self.btn_adaptive_compare.setChecked(compare)
+            self.btn_adaptive_compare.blockSignals(False)
+
     def sync_ui_from_backend(self):
         """Synchronize all GUI widget values from the active profile state."""
         app = self.audio_app
@@ -718,6 +895,25 @@ class UpmixerWindow(QMainWindow):
         if hasattr(self, 'btn_master'): self.btn_master.setChecked(app.upmix_enabled)
         if hasattr(self, 'btn_ind'): self.btn_ind.setChecked(app.independent_panning)
         if hasattr(self, 'btn_bypass'): self.btn_bypass.setChecked(getattr(app, 'bypass_all', False))
+        if hasattr(self, 'btn_secondary_enable'):
+            self.btn_secondary_enable.blockSignals(True)
+            self.btn_secondary_enable.setChecked(getattr(app, 'secondary_output_enabled', False))
+            self.btn_secondary_enable.blockSignals(False)
+        if hasattr(self, 'btn_secondary_mono'):
+            self.btn_secondary_mono.blockSignals(True)
+            self.btn_secondary_mono.setChecked(getattr(app, 'secondary_output_mono_sum', True))
+            self.btn_secondary_mono.blockSignals(False)
+        if hasattr(self, 'combo_secondary_source'):
+            idx = self.combo_secondary_source.findData(getattr(app, 'secondary_output_source_mode', 'lfe_or_bass_mix'))
+            if idx >= 0:
+                self.combo_secondary_source.blockSignals(True)
+                self.combo_secondary_source.setCurrentIndex(idx)
+                self.combo_secondary_source.blockSignals(False)
+        if hasattr(self, 'sld_secondary_gain'): self.sld_secondary_gain.set_value(getattr(app, 'secondary_output_gain_db', 0.0))
+        if hasattr(self, 'sld_secondary_lowpass'): self.sld_secondary_lowpass.set_value(getattr(app, 'secondary_output_lowpass_hz', 80.0))
+        if hasattr(self, 'sld_secondary_highpass'): self.sld_secondary_highpass.set_value(getattr(app, 'secondary_output_highpass_hz', 20.0))
+        if hasattr(self, 'sld_secondary_delay'): self.sld_secondary_delay.set_value(getattr(app, 'secondary_output_delay_ms', 0.0))
+        self.refresh_adaptive_ui()
 
     def update_slider_states(self):
         app = self.audio_app
@@ -735,7 +931,10 @@ class UpmixerWindow(QMainWindow):
         if hasattr(self, 'btn_ind'): self.btn_ind.setDisabled(is_bypass)
         if hasattr(self, 'btn_import'): self.btn_import.setDisabled(is_bypass)
         if hasattr(self, 'btn_export'): self.btn_export.setDisabled(is_bypass)
-        if hasattr(self, 'btn_calibrate'): self.btn_calibrate.setDisabled(is_bypass)
+        if hasattr(self, 'btn_adapt_observe'): self.btn_adapt_observe.setDisabled(is_bypass)
+        if hasattr(self, 'btn_adapt_assist'): self.btn_adapt_assist.setDisabled(is_bypass)
+        if hasattr(self, 'btn_adapt_full'): self.btn_adapt_full.setDisabled(is_bypass)
+        if hasattr(self, 'btn_adaptive_compare'): self.btn_adaptive_compare.setDisabled(is_bypass)
 
         if hasattr(self, 'option_buttons'):
             for b in self.option_buttons.values():
@@ -751,6 +950,19 @@ class UpmixerWindow(QMainWindow):
 
         if hasattr(self, 'radar'):
             self.radar.setDisabled(is_bypass or is_cinema or is_stereo or is_hp)
+
+        secondary_enabled = getattr(app, 'secondary_output_enabled', False)
+        secondary_controls = [
+            'combo_secondary_source',
+            'sld_secondary_gain',
+            'sld_secondary_lowpass',
+            'sld_secondary_highpass',
+            'sld_secondary_delay',
+            'btn_secondary_mono',
+        ]
+        for name in secondary_controls:
+            if hasattr(self, name):
+                getattr(self, name).setDisabled(is_bypass or not secondary_enabled)
 
         if is_bypass:
             return
@@ -831,6 +1043,8 @@ class UpmixerWindow(QMainWindow):
     def refresh_devices(self):
         self.combo_in.clear()
         self.combo_out.clear()
+        self.combo_secondary_out.clear()
+        self.combo_secondary_out.addItem("Disabled / None", "")
 
         try:
             devices = sd.query_devices()
@@ -849,12 +1063,17 @@ class UpmixerWindow(QMainWindow):
                         self.combo_in.addItem(f"{d['name']} ({d['max_input_channels']} In)", d['name'])
                     if d['max_output_channels'] > 0:
                         self.combo_out.addItem(f"{d['name']} ({d['max_output_channels']} Out)", d['name'])
+                        self.combo_secondary_out.addItem(f"{d['name']} ({d['max_output_channels']} Out)", d['name'])
 
             idx_in = self.combo_in.findData(self.audio_app.input_name)
             if idx_in >= 0: self.combo_in.setCurrentIndex(idx_in)
 
             idx_out = self.combo_out.findData(self.audio_app.output_name)
             if idx_out >= 0: self.combo_out.setCurrentIndex(idx_out)
+
+            idx_secondary = self.combo_secondary_out.findData(getattr(self.audio_app, 'secondary_output_device', ''))
+            if idx_secondary >= 0:
+                self.combo_secondary_out.setCurrentIndex(idx_secondary)
 
             self.combo_cam.clear()
             self.combo_cam.addItem("Default (Index 0)", "")
@@ -877,13 +1096,14 @@ class UpmixerWindow(QMainWindow):
     def apply_devices(self):
         in_name = self.combo_in.currentData()
         out_name = self.combo_out.currentData()
+        secondary_out_name = self.combo_secondary_out.currentData()
         if in_name and out_name:
             self.btn_apply_dev.setText("APPLYING...")
             self.btn_apply_dev.setEnabled(False)
             QApplication.processEvents()
 
             try:
-                self.audio_app.change_devices(in_name, out_name)
+                self.audio_app.change_devices(in_name, out_name, secondary_out_name)
 
                 cam_name = self.combo_cam.currentData()
                 if cam_name and cam_name.startswith("idx:"):
@@ -919,6 +1139,7 @@ class UpmixerWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "Import Config", "", "JSON Files (*.json)")
         if path:
             self.audio_app.load_config(path)
+            self.refresh_devices()
             self.radar.puck_pos = QPointF(self.audio_app.gui_panning_x, self.audio_app.gui_panning_y)
             self.btn_ind.setChecked(self.audio_app.independent_panning)
             self.radar.set_independent_panning(self.audio_app.independent_panning)
@@ -935,6 +1156,44 @@ class UpmixerWindow(QMainWindow):
     def update_gui(self):
         peaks = getattr(self.audio_app, 'last_peaks', [0.0]*8)
         self.radar.set_peaks(peaks)
+
+        snapshot = getattr(self.audio_app, 'get_adaptive_snapshot', lambda: {})()
+        state = getattr(self.audio_app, 'get_adaptive_state', lambda: {})()
+        if hasattr(self, 'lbl_adaptive'):
+            mode = getattr(self.audio_app, 'adaptive_mode', 'observe').upper()
+            profile = getattr(self.audio_app, 'adaptive_profile', 'neutral').upper()
+            compare = 'STATIC A/B' if getattr(self.audio_app, 'adaptive_compare_bypass', False) else 'ADAPTIVE'
+            raw_targets = state.get('targets', {}) if isinstance(state, dict) else {}
+            applied_targets = state.get('applied_targets', raw_targets) if isinstance(state, dict) else {}
+            support = state.get('target_support', {}) if isinstance(state, dict) else {}
+            bool_summary = [
+                f"focus={'ON' if applied_targets.get('dialogue_focus', False) else 'off'}",
+                f"vocal={'ON' if applied_targets.get('vocal_lock', False) else 'off'}",
+                f"center_manual={'ON' if getattr(self.audio_app, 'center_extraction', False) else 'off'}",
+                f"hp_ext={'ON' if applied_targets.get('hp_externalization', False) else 'off'}",
+            ]
+            limited = [name for name, enabled in support.items() if not enabled and name in raw_targets]
+            limit_note = f"\nobserve-only/no-op: {', '.join(limited)}" if limited else ""
+            self.lbl_adaptive.setText(
+                f"MODE: {mode} | PROFILE: {profile} | {compare}\n"
+                f"dialogue={snapshot.get('dialogue_score', 0.0):.2f}  immersion={snapshot.get('immersion_score', 0.0):.2f}  compression={snapshot.get('compression_score', 0.0):.2f}\n"
+                f"mud={snapshot.get('mud_score', 0.0):.2f}  air={snapshot.get('air_score', 0.0):.2f}  surround={snapshot.get('surround_discreteness', 0.0):.2f}\n"
+                f"clarity={applied_targets.get('clarity_amount', 0.0):.2f}  width={applied_targets.get('width_factor', 0.0):.2f}  room={applied_targets.get('virtual_room_mix', 0.0):.2f}\n"
+                f"air_amt={applied_targets.get('air_amount', 0.0):.2f}  micro={applied_targets.get('micro_dyn_amount', 0.0):.2f}  transient={applied_targets.get('transient_amount', 0.0):.2f}\n"
+                f"{'  '.join(bool_summary)}{limit_note}"
+            )
+
+        if hasattr(self, 'lbl_secondary_status'):
+            enabled = getattr(self.audio_app, 'secondary_output_enabled', False)
+            device = getattr(self.audio_app, 'secondary_output_device', '') or 'Disabled / None'
+            source = getattr(self.audio_app, 'secondary_output_source_mode', 'lfe_or_bass_mix').replace('_', ' ').upper()
+            mode = 'MONO' if getattr(self.audio_app, 'secondary_output_mono_sum', True) else 'STEREO'
+            self.lbl_secondary_status.setText(
+                f"ENABLED: {'YES' if enabled else 'NO'}\n"
+                f"device={device}\n"
+                f"source={source}  mode={mode}\n"
+                f"gain={getattr(self.audio_app, 'secondary_output_gain_db', 0.0):.2f} dB  lp={getattr(self.audio_app, 'secondary_output_lowpass_hz', 80.0):.1f} Hz  hp={getattr(self.audio_app, 'secondary_output_highpass_hz', 20.0):.1f} Hz  delay={getattr(self.audio_app, 'secondary_output_delay_ms', 0.0):.1f} ms"
+            )
 
     def start_calibration(self):
         from PySide6.QtWidgets import QDialog

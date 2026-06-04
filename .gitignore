@@ -1,5 +1,8 @@
 __pycache__/
 *.pyc
 .claude/
+.aider.chat.history.md
+.aider.input.history
+.env
 debug_cameras.txt
 my_config.json

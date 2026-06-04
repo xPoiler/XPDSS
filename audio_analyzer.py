@@ -16,6 +16,16 @@ import numpy as np
 import json
 from PIL import Image
 import pystray
+from adaptive_control import AdaptiveController
+from adaptive_renderer import AdaptiveFeatureEngine
+from xpdss_state import (
+    apply_adaptive_state_to_object,
+    apply_profile_to_object,
+    apply_secondary_output_state_to_object,
+    build_adaptive_state_from_object,
+    build_profile_from_object,
+    build_secondary_output_state_from_object,
+)
 
 # Constants for detection
 RMS_THRESHOLD = 0.005
@@ -118,6 +128,7 @@ class AudioBypass:
         self.callback_count = 0
         
         self.config_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+        preloaded_secondary_state = {}
         try:
             with open(self.config_file, 'r') as f:
                 d = json.load(f)
@@ -126,6 +137,22 @@ class AudioBypass:
                 self.webcam_name = d.get("webcam_device", "")
                 self.webcam_index = d.get("webcam_index", 0)
                 self.mic_comp_ratio = d.get("mic_comp_ratio", 4.0)
+                preloaded_secondary_state = d.get("secondary_output", {})
+                if not preloaded_secondary_state:
+                    preloaded_secondary_state = {
+                        key: d[key]
+                        for key in (
+                            "secondary_output_enabled",
+                            "secondary_output_device",
+                            "secondary_output_gain_db",
+                            "secondary_output_lowpass_hz",
+                            "secondary_output_highpass_hz",
+                            "secondary_output_delay_ms",
+                            "secondary_output_source_mode",
+                            "secondary_output_mono_sum",
+                        )
+                        if key in d
+                    }
         except Exception:
             self.input_name = input_name
             self.output_name = output_name
@@ -177,6 +204,34 @@ class AudioBypass:
         self.analysis_thread = None
         self.input_stream = None
         self.output_stream = None
+        self.secondary_output_stream = None
+        self.secondary_output_device_id = None
+        self.secondary_output_rate = self.sample_rate
+        self.secondary_output_channels = 2
+        self.secondary_output_max_ch = 0
+        self.secondary_output_buffer_lock = threading.Lock()
+        self.secondary_output_ring_buffer_size = int(self.sample_rate * 0.25)
+        self.secondary_output_buffer = np.zeros((self.secondary_output_ring_buffer_size, self.secondary_output_channels), dtype=np.float32)
+        self.secondary_output_write_ptr = 0
+        self.secondary_output_read_ptr = 0
+        self.secondary_output_available_samples = 0
+        self.secondary_output_target_latency_samples = int(self.sample_rate * 0.040)
+        self._secondary_output_read_pre = np.zeros((8192, self.secondary_output_channels), dtype=np.float32)
+        self._secondary_output_delay_state = {}
+        self._secondary_output_hp_sos = None
+        self._secondary_output_lp_sos = None
+        self._secondary_output_hp_zi = {}
+        self._secondary_output_lp_zi = {}
+        apply_secondary_output_state_to_object(self, preloaded_secondary_state)
+        self.adaptive_monitor_enabled = True
+        self.adaptive_observe_only = True
+        self.adaptive_snapshot = {}
+        self.adaptive_engine = AdaptiveFeatureEngine(self.sample_rate, smoothing=0.85)
+        self.adaptive_mode = "observe"
+        self.adaptive_profile = "neutral"
+        self.adaptive_compare_bypass = False
+        self.adaptive_state = {}
+        self.adaptive_controller = AdaptiveController(smoothing=0.82)
         
         # Upmixing State
         self.upmix_enabled = True # Overall bypass
@@ -308,6 +363,7 @@ class AudioBypass:
         
         # #16 Dynamic Dialogue Intelligibility
         self.dialogue_enhance = False
+        self.dialogue_focus = False
         self._diag_gain_smooth = 1.0
         
         # #12 Transaural Widening (Crosstalk Cancellation)
@@ -498,6 +554,9 @@ class AudioBypass:
         if self.output_stream:
             try: self.output_stream.stop(); self.output_stream.close()
             except: pass
+        if self.secondary_output_stream:
+            try: self.secondary_output_stream.stop(); self.secondary_output_stream.close()
+            except: pass
         # Mic stream cleanup removed as mic processing is deprecated
 
     def _find_device(self, name, is_input=True):
@@ -541,8 +600,7 @@ class AudioBypass:
                 # Perform analysis on channels
                 # data is (frames, channels)
                 frames, chs = data.shape
-                if chs <= 2:
-                    self.is_multichannel_detected = False
+                if chs < 2:
                     continue
 
                 # 1. Check for signal activity in surround channels (2+)
@@ -550,7 +608,11 @@ class AudioBypass:
                 active = peak > RMS_THRESHOLD
                 
                 has_surround_signal = False
-                if np.any(active[2:]):
+                if chs <= 2:
+                    # Stereo sources still feed GUI metering, width tracking, and
+                    # adaptive analysis below; they simply are not discrete surround.
+                    self.is_multichannel_detected = False
+                elif np.any(active[2:]):
                     # 2. Distinguish: Is it Real Surround or just our Upmix?
                     # We EXCLUDE LFE (index 3) from discrete detection
                     L = data[:, 0]
@@ -627,6 +689,20 @@ class AudioBypass:
                             self.correlation_smooth = self.correlation_smooth * 0.95 + abs(corr) * 0.05
                     except: pass
 
+                if getattr(self, 'adaptive_monitor_enabled', False) and getattr(self, 'adaptive_engine', None):
+                    try:
+                        snapshot = self.adaptive_engine.analyze_block(data)
+                        self.adaptive_snapshot = snapshot.to_dict()
+                        if getattr(self, 'adaptive_controller', None):
+                            state = self.adaptive_controller.update(
+                                self.adaptive_snapshot,
+                                output_mode=getattr(self, 'current_mode', 'speakers'),
+                                profile=getattr(self, 'adaptive_profile', 'neutral'),
+                            )
+                            self._publish_adaptive_state(state)
+                    except Exception as adaptive_error:
+                        print(f"Adaptive analysis error: {adaptive_error}")
+
                 if time.time() - self.last_active_time > STABILITY_WINDOW:
                     self.is_multichannel_detected = False
                     
@@ -638,6 +714,376 @@ class AudioBypass:
     def get_active_channels(self, data):
         # This is no longer used in the callback; moved to worker
         pass
+
+    def get_adaptive_snapshot(self):
+        return dict(getattr(self, 'adaptive_snapshot', {}))
+
+    def get_adaptive_state(self):
+        return dict(getattr(self, 'adaptive_state', {}))
+
+    def _adaptive_strength(self):
+        if not getattr(self, 'adaptive_monitor_enabled', False):
+            return 0.0
+        if getattr(self, 'adaptive_compare_bypass', False):
+            return 0.0
+        mode = getattr(self, 'adaptive_mode', 'observe')
+        if mode == 'assist':
+            return 0.45
+        if mode == 'full':
+            return 1.0
+        return 0.0
+
+    def _adaptive_value(self, key, fallback):
+        strength = self._adaptive_strength()
+        if strength <= 0.0:
+            return fallback
+        target = getattr(self, 'adaptive_state', {}).get('targets', {}).get(key)
+        if target is None or isinstance(target, bool):
+            return fallback
+        return float(fallback) * (1.0 - strength) + float(target) * strength
+
+    def _adaptive_bool(self, key, fallback=False):
+        strength = self._adaptive_strength()
+        if strength <= 0.0:
+            return fallback
+        target = getattr(self, 'adaptive_state', {}).get('targets', {}).get(key)
+        if target is None:
+            return fallback
+        if strength < 1.0:
+            return bool(fallback)
+        return bool(target)
+
+    def _adaptive_passthrough_active(self):
+        return bool(
+            (self.is_multichannel_detected and not self.manual_upmix)
+            or self.current_channels <= 2
+            or not self.upmix_enabled
+        )
+
+    def _adaptive_target_supported(self, key):
+        out_ch = getattr(self, 'current_channels', 2)
+        mode = getattr(self, 'current_mode', 'speakers')
+        passthrough = self._adaptive_passthrough_active()
+        if key in {'clarity_amount', 'virtual_room_mix', 'air_amount', 'micro_dyn_amount', 'transient_amount'}:
+            return True
+        if key == 'width_factor':
+            return mode == 'speakers' and out_ch > 2 and not passthrough
+        if key in {'dialogue_focus', 'vocal_lock'}:
+            return out_ch > 2
+        if key == 'hp_externalization':
+            return mode == 'headphones' and out_ch >= 2
+        return False
+
+    def _build_adaptive_applied_targets(self, state_dict=None):
+        source_state = state_dict if isinstance(state_dict, dict) else (getattr(self, 'adaptive_state', {}) or {})
+        applied = {}
+        supported = {}
+        defaults = {
+            'clarity_amount': getattr(self, 'clarity_amount', 4.0),
+            'width_factor': getattr(self, 'width_factor', 1.0),
+            'virtual_room_mix': getattr(self, 'virtual_room_mix', 0.25),
+            'air_amount': getattr(self, 'air_amount', 0.3),
+            'micro_dyn_amount': getattr(self, 'micro_dyn_amount', 4.0),
+            'transient_amount': getattr(self, 'transient_amount', 4.0),
+            'dialogue_focus': getattr(self, 'dialogue_focus', False),
+            'vocal_lock': getattr(self, 'vocal_lock', False),
+            'hp_externalization': getattr(self, 'hp_externalization', False),
+        }
+        previous_state = getattr(self, 'adaptive_state', {})
+        self.adaptive_state = source_state
+        try:
+            for key, fallback in defaults.items():
+                supported[key] = self._adaptive_target_supported(key)
+                if isinstance(fallback, bool):
+                    applied[key] = self._adaptive_bool(key, fallback) if supported[key] else bool(fallback)
+                else:
+                    applied[key] = self._adaptive_value(key, fallback) if supported[key] else float(fallback)
+        finally:
+            self.adaptive_state = previous_state
+        return applied, supported
+
+    def _publish_adaptive_state(self, state):
+        state_dict = state.to_dict() if hasattr(state, 'to_dict') else dict(state or {})
+        applied_targets, supported_targets = self._build_adaptive_applied_targets(state_dict)
+        state_dict['applied_targets'] = applied_targets
+        state_dict['target_support'] = supported_targets
+        self.adaptive_state = state_dict
+        return state_dict
+
+    def _valid_sos(self, sos):
+        """True when a SciPy SOS filter is initialized and safe for sosfilt."""
+        try:
+            arr = np.asarray(sos)
+            return arr.ndim == 2 and arr.shape[1] == 6 and arr.shape[0] > 0
+        except Exception:
+            return False
+
+    def _ensure_sos_filters(self, *attrs):
+        """Initialize shared SOS filters on demand; never let real-time DSP crash.
+
+        Some adaptive paths can enable DSP modules even when their manual toggle
+        was off at startup.  Those modules still need the shared filter bank that
+        older code only initialized lazily from other feature paths.
+        """
+        tracked_attrs = tuple(attrs)
+        previous_signatures = {
+            attr: tuple(np.asarray(getattr(self, attr, None)).shape)
+            if self._valid_sos(getattr(self, attr, None)) else None
+            for attr in tracked_attrs
+        }
+        if all(previous_signatures[attr] is not None for attr in tracked_attrs):
+            return True
+        try:
+            self._init_multiband_filters()
+        except Exception as exc:
+            last_msg = getattr(self, '_last_filter_init_error', None)
+            msg = str(exc)
+            if msg != last_msg:
+                print(f"Filter init error: {exc}")
+                self._last_filter_init_error = msg
+            return False
+
+        changed = []
+        for attr in tracked_attrs:
+            current = getattr(self, attr, None)
+            if not self._valid_sos(current):
+                return False
+            current_signature = tuple(np.asarray(current).shape)
+            if previous_signatures.get(attr) != current_signature:
+                changed.append(attr)
+        if changed:
+            self._reset_sos_dependents(*changed)
+        return True
+
+    def _reset_sos_dependents(self, *sos_attrs):
+        reset_map = {
+            '_clarity_mud_sos': ('_clarity_mud_zi',),
+            '_clarity_peak_sos': ('_clarity_zi',),
+            '_room_lp_sos': ('_room_lp_zi', '_room_delay_buf', '_room_delay_ptr'),
+            '_air_hp_sos': ('_air_hp_zi',),
+        }
+        for sos_attr in sos_attrs:
+            for dep in reset_map.get(sos_attr, ()):
+                current = getattr(self, dep, None)
+                if isinstance(current, dict):
+                    current.clear()
+                elif isinstance(current, np.ndarray):
+                    setattr(self, dep, None)
+                elif dep.endswith('_ptr'):
+                    setattr(self, dep, 0)
+                else:
+                    setattr(self, dep, {} if dep.endswith('_zi') else None)
+
+    def _ensure_sos_zi(self, store, key, sos):
+        zi = store.get(key)
+        expected_shape = (np.asarray(sos).shape[0], 2)
+        if not isinstance(zi, np.ndarray) or zi.shape != expected_shape:
+            store[key] = sosfilt_zi(sos) * 0.0
+        return store[key]
+
+    def _reset_secondary_output_runtime(self):
+        channels = max(1, int(getattr(self, 'secondary_output_channels', 2) or 1))
+        self.secondary_output_buffer = np.zeros((self.secondary_output_ring_buffer_size, channels), dtype=np.float32)
+        self.secondary_output_write_ptr = 0
+        self.secondary_output_read_ptr = 0
+        self.secondary_output_available_samples = 0
+        self._secondary_output_read_pre = np.zeros((8192, channels), dtype=np.float32)
+        self._secondary_output_delay_state.clear()
+        self._secondary_output_hp_zi.clear()
+        self._secondary_output_lp_zi.clear()
+
+    def _resolve_secondary_output_device(self):
+        self.secondary_output_device_id = None
+        self.secondary_output_max_ch = 0
+        self.secondary_output_rate = self.sample_rate
+        if not getattr(self, 'secondary_output_device', ''):
+            return False
+        try:
+            dev_id, max_ch, dev_rate = self._find_device(self.secondary_output_device, is_input=False)
+        except Exception as e:
+            print(f"Secondary output unavailable: {e}")
+            return False
+        self.secondary_output_device_id = dev_id
+        self.secondary_output_max_ch = max_ch
+        self.secondary_output_rate = dev_rate
+        self.secondary_output_channels = 2 if max_ch >= 2 else 1
+        return True
+
+    def close_secondary_output_stream(self):
+        if self.secondary_output_stream:
+            try:
+                self.secondary_output_stream.stop()
+                self.secondary_output_stream.close()
+            except Exception:
+                pass
+            self.secondary_output_stream = None
+
+    def open_secondary_output_stream(self):
+        if self.simulation:
+            return
+        self.close_secondary_output_stream()
+        if not getattr(self, 'secondary_output_enabled', False):
+            return
+        if not self._resolve_secondary_output_device():
+            return
+        self._reset_secondary_output_runtime()
+        try:
+            self.secondary_output_stream = sd.OutputStream(
+                device=self.secondary_output_device_id,
+                samplerate=self.sample_rate,
+                blocksize=self.blocksize,
+                dtype='float32',
+                channels=self.secondary_output_channels,
+                callback=self.secondary_output_callback,
+                latency='low'
+            )
+            self.secondary_output_stream.start()
+            print(f"Secondary Output active: {self.secondary_output_channels} channels -> {self.secondary_output_device}")
+        except Exception as e:
+            print(f"Failed to open secondary output stream: {e}")
+            self.secondary_output_stream = None
+
+    def refresh_secondary_output_filters(self):
+        self._init_multiband_filters()
+        self._secondary_output_hp_zi.clear()
+        self._secondary_output_lp_zi.clear()
+
+    def refresh_secondary_output_stream(self):
+        self.close_secondary_output_stream()
+        if getattr(self, 'secondary_output_enabled', False):
+            self.open_secondary_output_stream()
+
+    def set_secondary_output_enabled(self, enabled):
+        self.secondary_output_enabled = bool(enabled)
+        self.save_config()
+        self.refresh_secondary_output_stream()
+
+    def set_secondary_output_device(self, device_name):
+        self.secondary_output_device = device_name or ""
+        self.save_config()
+        self.refresh_secondary_output_stream()
+
+    def _apply_secondary_output_delay(self, mono_block, key='mono'):
+        delay_samples = int(max(0.0, getattr(self, 'secondary_output_delay_ms', 0.0)) * self.sample_rate / 1000.0)
+        if delay_samples <= 0:
+            return mono_block
+        needed = max(1, delay_samples + len(mono_block) + 1)
+        state = self._secondary_output_delay_state.get(key)
+        if not state or state['buffer'].shape[0] < needed:
+            state = {
+                'buffer': np.zeros(needed, dtype=np.float32),
+                'ptr': 0,
+            }
+            self._secondary_output_delay_state[key] = state
+        delayed = np.empty_like(mono_block)
+        buf = state['buffer']
+        buf_len = buf.shape[0]
+        ptr = state['ptr']
+        for i, sample in enumerate(mono_block):
+            read_ptr = (ptr - delay_samples) % buf_len
+            delayed[i] = buf[read_ptr]
+            buf[ptr] = sample
+            ptr = (ptr + 1) % buf_len
+        state['ptr'] = ptr
+        return delayed
+
+    def _filter_secondary_output_mono(self, mono_block, key='mono'):
+        block = np.asarray(mono_block, dtype=np.float32).copy()
+        if self._secondary_output_hp_sos is not None:
+            zi = self._ensure_sos_zi(self._secondary_output_hp_zi, key, self._secondary_output_hp_sos)
+            block, self._secondary_output_hp_zi[key] = sosfilt(self._secondary_output_hp_sos, block, zi=zi)
+        if self._secondary_output_lp_sos is not None:
+            zi = self._ensure_sos_zi(self._secondary_output_lp_zi, key, self._secondary_output_lp_sos)
+            block, self._secondary_output_lp_zi[key] = sosfilt(self._secondary_output_lp_sos, block, zi=zi)
+        return block
+
+    def _build_secondary_output_block(self, speaker_block, src_block=None):
+        if speaker_block is None or speaker_block.size == 0:
+            return None
+        frames = speaker_block.shape[0]
+        ch = speaker_block.shape[1]
+        source_mode = getattr(self, 'secondary_output_source_mode', 'lfe_or_bass_mix')
+        mono_sum = getattr(self, 'secondary_output_mono_sum', True)
+        gain = float(10.0 ** (getattr(self, 'secondary_output_gain_db', 0.0) / 20.0))
+
+        if source_mode == 'front_bass_mix' or ch <= 3:
+            base_left = speaker_block[:, 0]
+            base_right = speaker_block[:, 1] if ch > 1 else speaker_block[:, 0]
+        else:
+            lfe = speaker_block[:, 3] if ch > 3 else speaker_block[:, 0]
+            if ch > 1:
+                stereo_mix = 0.5 * (speaker_block[:, 0] + speaker_block[:, 1])
+            else:
+                stereo_mix = speaker_block[:, 0]
+            base_left = lfe + (0.25 * stereo_mix)
+            base_right = lfe + (0.25 * stereo_mix)
+
+        if mono_sum or self.secondary_output_channels == 1:
+            mono = 0.5 * (base_left + base_right)
+            mono = self._filter_secondary_output_mono(mono, key='mono')
+            mono = self._apply_secondary_output_delay(mono, key='mono')
+            mono *= gain
+            mono = np.clip(mono, -1.0, 1.0)
+            if self.secondary_output_channels == 1:
+                return mono.reshape(frames, 1)
+            return np.repeat(mono.reshape(frames, 1), self.secondary_output_channels, axis=1)
+
+        left = self._filter_secondary_output_mono(base_left, key='left')
+        right = self._filter_secondary_output_mono(base_right, key='right')
+        left = self._apply_secondary_output_delay(left, key='left')
+        right = self._apply_secondary_output_delay(right, key='right')
+        block = np.column_stack([left, right]).astype(np.float32)
+        block *= gain
+        return np.clip(block, -1.0, 1.0)
+
+    def _enqueue_secondary_output_block(self, block):
+        if block is None or block.size == 0:
+            return
+        block = np.asarray(block, dtype=np.float32)
+        if block.ndim == 1:
+            block = block.reshape(-1, 1)
+        frames, channels = block.shape
+        with self.secondary_output_buffer_lock:
+            if self.secondary_output_buffer.shape[1] != channels:
+                self.secondary_output_channels = channels
+                self._reset_secondary_output_runtime()
+            if frames >= self.secondary_output_ring_buffer_size:
+                block = block[-self.secondary_output_ring_buffer_size:]
+                frames = block.shape[0]
+            overflow = max(0, self.secondary_output_available_samples + frames - self.secondary_output_ring_buffer_size)
+            if overflow:
+                self.secondary_output_read_ptr = (self.secondary_output_read_ptr + overflow) % self.secondary_output_ring_buffer_size
+                self.secondary_output_available_samples -= overflow
+            end1 = min(frames, self.secondary_output_ring_buffer_size - self.secondary_output_write_ptr)
+            self.secondary_output_buffer[self.secondary_output_write_ptr:self.secondary_output_write_ptr + end1] = block[:end1]
+            if end1 < frames:
+                self.secondary_output_buffer[:frames - end1] = block[end1:]
+            self.secondary_output_write_ptr = (self.secondary_output_write_ptr + frames) % self.secondary_output_ring_buffer_size
+            self.secondary_output_available_samples += frames
+
+    def secondary_output_callback(self, outdata, frames, time_info, status):
+        if status:
+            print(f"Secondary Output Warning: {status}")
+        outdata.fill(0)
+        with self.secondary_output_buffer_lock:
+            available = self.secondary_output_available_samples
+            if available <= 0:
+                return
+            take = min(frames, available)
+            if self._secondary_output_read_pre.shape[0] < frames or self._secondary_output_read_pre.shape[1] != outdata.shape[1]:
+                self._secondary_output_read_pre = np.zeros((max(frames, 8192), outdata.shape[1]), dtype=np.float32)
+            temp = self._secondary_output_read_pre[:take, :outdata.shape[1]]
+            end1 = min(take, self.secondary_output_ring_buffer_size - self.secondary_output_read_ptr)
+            temp[:end1] = self.secondary_output_buffer[self.secondary_output_read_ptr:self.secondary_output_read_ptr + end1, :outdata.shape[1]]
+            if end1 < take:
+                temp[end1:take] = self.secondary_output_buffer[:take - end1, :outdata.shape[1]]
+            self.secondary_output_read_ptr = (self.secondary_output_read_ptr + take) % self.secondary_output_ring_buffer_size
+            self.secondary_output_available_samples -= take
+            if self.secondary_output_available_samples > self.secondary_output_target_latency_samples + frames:
+                trim = self.secondary_output_available_samples - self.secondary_output_target_latency_samples
+                self.secondary_output_read_ptr = (self.secondary_output_read_ptr + trim) % self.secondary_output_ring_buffer_size
+                self.secondary_output_available_samples -= trim
+        outdata[:take] = temp[:take]
 
     def open_input_stream(self):
         if self.input_stream: return
@@ -769,6 +1215,13 @@ class AudioBypass:
 
         # #26 Harmonic Air Exciter HPF (10.5kHz)
         self._air_hp_sos = butter(2, 10500.0 / (sr / 2.0), btype='high', output='sos')
+
+        # Secondary bass-shaker output filters
+        shaker_hp = min(0.95, max(5.0, getattr(self, 'secondary_output_highpass_hz', 20.0)) / (sr / 2.0))
+        shaker_lp = min(0.95, max(getattr(self, 'secondary_output_highpass_hz', 20.0) + 5.0, getattr(self, 'secondary_output_lowpass_hz', 80.0)) / (sr / 2.0))
+        if shaker_hp < shaker_lp:
+            self._secondary_output_hp_sos = butter(2, shaker_hp, btype='high', output='sos')
+            self._secondary_output_lp_sos = butter(2, shaker_lp, btype='low', output='sos')
 
     def _apply_head_tracking_panning(self, out_block, frames, out_ch, is_passthrough=False):
         """Dynamic Sweet-Spot Loudness Panning applied globally (Fronts & Surrounds)."""
@@ -1204,7 +1657,8 @@ class AudioBypass:
 
         # Map ratio to gain: 1.0 = sustained (no boost), above 1.2 = onset.
         # 20% dead zone filters out minor envelope wobble from normal dynamics
-        max_boost = 10.0 ** (self.transient_amount / 20.0)
+        transient_amount = self._adaptive_value('transient_amount', getattr(self, 'transient_amount', 4.0))
+        max_boost = 10.0 ** (transient_amount / 20.0)
         raw_gain = 1.0 + gate * (max_boost - 1.0) * np.clip(
             (ratio - 1.2) / (2.5 - 1.2), 0.0, 1.0)
 
@@ -1277,7 +1731,7 @@ class AudioBypass:
         if n_samp < 64:
             return
 
-        max_boost_db = getattr(self, 'micro_dyn_amount', 4.0)
+        max_boost_db = self._adaptive_value('micro_dyn_amount', getattr(self, 'micro_dyn_amount', 4.0))
 
         # ── Lazy-init state ──
         if not hasattr(self, '_ud_ref_db') or len(self._ud_ref_db) != n_ch:
@@ -1513,12 +1967,14 @@ class AudioBypass:
 
     def _apply_clarity_dsp(self, block):
         """Dynamic De-Mudding: Attenuates 200-500Hz when energy in that band is excessive."""
-        if not getattr(self, 'clarity_dsp', False):
+        if not getattr(self, 'clarity_dsp', False) and self._adaptive_strength() <= 0.0:
             return
             
         sr = self.sample_rate
         frames = block.shape[0]
         n_ch = block.shape[1]
+        if not self._ensure_sos_filters('_clarity_mud_sos', '_clarity_peak_sos'):
+            return
         
         # 1. Detect mud activity (L/R only for efficiency)
         detect_ch = min(n_ch, 2)
@@ -1529,9 +1985,8 @@ class AudioBypass:
         # Detect energy in 200-500Hz band
         mud_sig = np.zeros((frames, detect_ch), dtype=np.float32)
         for ch in range(detect_ch):
-            if ch not in self._clarity_mud_zi:
-                self._clarity_mud_zi[ch] = sosfilt_zi(self._clarity_mud_sos) * 0
-            mud_sig[:, ch], self._clarity_mud_zi[ch] = sosfilt(self._clarity_mud_sos, block[:, ch], zi=self._clarity_mud_zi[ch])
+            zi = self._ensure_sos_zi(self._clarity_mud_zi, ch, self._clarity_mud_sos)
+            mud_sig[:, ch], self._clarity_mud_zi[ch] = sosfilt(self._clarity_mud_sos, block[:, ch], zi=zi)
             
         mud_rms = np.sqrt(np.mean(mud_sig**2) + 1e-12)
         bb_rms = np.sqrt(np.mean(block[:, :detect_ch]**2) + 1e-12)
@@ -1543,10 +1998,11 @@ class AudioBypass:
         threshold = 0.40
         sensitivity = 2.0 # Response aggressiveness
         
+        clarity_amount = self._adaptive_value('clarity_amount', getattr(self, 'clarity_amount', 4.0))
+        max_blend = np.clip(clarity_amount / 12.0, 0.08, 0.55)
         target_attenuation = 0.0
         if ratio > threshold:
-            # Scale of 0.0 to 0.5 (where 0.5 is -6dB at 350Hz)
-            target_attenuation = np.clip((ratio - threshold) * sensitivity, 0.0, 0.5)
+            target_attenuation = np.clip((ratio - threshold) * sensitivity, 0.0, max_blend)
             
         # Smooth the gain changes (tau = 80ms)
         alpha = 1.0 - np.exp(-frames / (sr * 0.08))
@@ -1554,17 +2010,17 @@ class AudioBypass:
         
         if self._clarity_gain_smooth > 0.001:
             for ch in range(n_ch):
-                if ch not in self._clarity_zi:
-                    self._clarity_zi[ch] = sosfilt_zi(self._clarity_peak_sos) * 0
-                
-                notched_sig, self._clarity_zi[ch] = sosfilt(self._clarity_peak_sos, block[:, ch], zi=self._clarity_zi[ch])
+                zi = self._ensure_sos_zi(self._clarity_zi, ch, self._clarity_peak_sos)
+                notched_sig, self._clarity_zi[ch] = sosfilt(self._clarity_peak_sos, block[:, ch], zi=zi)
                 
                 # Dynamic blend: out = sig * (1 - blend) + notched * blend
                 block[:, ch] = block[:, ch] * (1.0 - self._clarity_gain_smooth) + notched_sig * self._clarity_gain_smooth
 
     def _apply_virtual_room(self, block):
         """Virtual Room: Simulates early reflections (3-20ms) for enhanced spatiality."""
-        if not getattr(self, 'virtual_room', False):
+        if not getattr(self, 'virtual_room', False) and self._adaptive_strength() <= 0.0:
+            return
+        if not self._ensure_sos_filters('_room_lp_sos'):
             return
             
         sr = self.sample_rate
@@ -1609,12 +2065,11 @@ class AudioBypass:
                 
         # 4. Apply Damping (LPF) to reflections
         for ch in range(n_ch):
-            if ch not in self._room_lp_zi:
-                self._room_lp_zi[ch] = sosfilt_zi(self._room_lp_sos) * 0
-            reflections[:, ch], self._room_lp_zi[ch] = sosfilt(self._room_lp_sos, reflections[:, ch], zi=self._room_lp_zi[ch])
+            zi = self._ensure_sos_zi(self._room_lp_zi, ch, self._room_lp_sos)
+            reflections[:, ch], self._room_lp_zi[ch] = sosfilt(self._room_lp_sos, reflections[:, ch], zi=zi)
             
         # 5. Mix back
-        mix = getattr(self, 'virtual_room_mix', 0.25)
+        mix = self._adaptive_value('virtual_room_mix', getattr(self, 'virtual_room_mix', 0.25))
         # Normalize sum of reflections (Sum of gains ~ 1.2)
         reflections *= 0.5 
         
@@ -1625,7 +2080,9 @@ class AudioBypass:
 
     def _apply_air_exciter(self, block):
         """Harmonic Air Exciter: Restores/Enhances 10kHz+ detail using non-linear saturation."""
-        if not getattr(self, 'air_exciter', False):
+        if not getattr(self, 'air_exciter', False) and self._adaptive_strength() <= 0.0:
+            return
+        if not self._ensure_sos_filters('_air_hp_sos'):
             return
             
         n_ch = block.shape[1]
@@ -1634,9 +2091,8 @@ class AudioBypass:
         
         # 1. High-pass filter
         for ch in range(n_ch):
-            if ch not in self._air_hp_zi:
-                self._air_hp_zi[ch] = sosfilt_zi(self._air_hp_sos) * 0
-            excited[:, ch], self._air_hp_zi[ch] = sosfilt(self._air_hp_sos, block[:, ch], zi=self._air_hp_zi[ch])
+            zi = self._ensure_sos_zi(self._air_hp_zi, ch, self._air_hp_sos)
+            excited[:, ch], self._air_hp_zi[ch] = sosfilt(self._air_hp_sos, block[:, ch], zi=zi)
             
         # 2. Architect's "Verified" Soft-Knee Saturation (Vectorized)
         threshold = 0.8
@@ -1656,7 +2112,7 @@ class AudioBypass:
              excited[else_mask] = sign * threshold * (1.05) 
              
         # 3. Mix
-        amount = getattr(self, 'air_amount', 0.3)
+        amount = self._adaptive_value('air_amount', getattr(self, 'air_amount', 0.3))
         block += excited * amount
 
     def _apply_post_effects(self, out_block, out_ch, skip_subsynth=False, src_block=None, is_passthrough=False):
@@ -1683,20 +2139,20 @@ class AudioBypass:
             self._apply_loudness_comp(out_block, rms)
 
         # #24 Dynamic Clarity (De-Mudding)
-        if getattr(self, 'clarity_dsp', False):
+        if getattr(self, 'clarity_dsp', False) or self._adaptive_strength() > 0.0:
             self._apply_clarity_dsp(out_block)
 
         # #25 Virtual Room (Early Reflections)
-        if getattr(self, 'virtual_room', False):
+        if getattr(self, 'virtual_room', False) or self._adaptive_strength() > 0.0:
             self._apply_virtual_room(out_block)
 
         # #26 Harmonic Air Exciter
-        if getattr(self, 'air_exciter', False):
+        if getattr(self, 'air_exciter', False) or self._adaptive_strength() > 0.0:
             self._apply_air_exciter(out_block)
 
         # #16 Dynamic Dialogue Intelligibility (standalone, skipped when vocal_lock
         #      is active since vocal_lock already applies its own adaptive boost)
-        if getattr(self, 'dialogue_focus', False) and not getattr(self, 'vocal_lock', False) and out_ch > 2:
+        if self._adaptive_bool('dialogue_focus', getattr(self, 'dialogue_focus', False)) and not self._adaptive_bool('vocal_lock', getattr(self, 'vocal_lock', False)) and out_ch > 2:
             self._apply_dialogue_focus(out_block)
 
         # #13 Harmonic Bass Exciter (PBE) - Standalone toggle
@@ -1711,7 +2167,7 @@ class AudioBypass:
 
 
         # #5 Vocal Lock to Center
-        if self.vocal_lock and out_ch > 2:
+        if self._adaptive_bool('vocal_lock', self.vocal_lock) and out_ch > 2:
             self._apply_vocal_lock(out_block, frames)
 
         # #11 Subharmonic Synthesizer (Skip in passthrough)
@@ -1726,15 +2182,16 @@ class AudioBypass:
 
         # #23 Micro-Dynamics / Upward Compression (lifts quiet detail)
         # Snapshot before micro-dyn so transient restore can measure original dynamics
-        pre_micro_dyn = out_block.copy() if (getattr(self, 'micro_dynamics', False)
-                                              and getattr(self, 'transient_restore', False)) else None
-        if getattr(self, 'micro_dynamics', False):
+        micro_dyn_active = getattr(self, 'micro_dynamics', False)
+        transient_active = getattr(self, 'transient_restore', False)
+        pre_micro_dyn = out_block.copy() if (micro_dyn_active and transient_active) else None
+        if micro_dyn_active:
             self._apply_micro_dynamics(out_block)
 
         # #18 Transient Restoration (late — enhances final dynamics)
         # When micro-dyn is active, measure envelopes from pre-micro-dyn signal
         # so transient detection isn't fooled by the upward compression
-        if getattr(self, 'transient_restore', False):
+        if transient_active:
             self._apply_transient_restore(out_block, ref_block=pre_micro_dyn)
 
         # #12 Transaural Widening
@@ -1742,7 +2199,7 @@ class AudioBypass:
             self._apply_transaural_widener(out_block, frames)
 
         # #21 Headphone Externalization (after transaural, for HP mode)
-        if getattr(self, 'hp_externalization', False):
+        if self._adaptive_bool('hp_externalization', getattr(self, 'hp_externalization', False)):
             self._apply_hp_externalization(out_block)
 
         # #1 Independent Head Tracking Volume Panning (MUST RUN LAST for Absolute Room Alignment)
@@ -1965,10 +2422,10 @@ class AudioBypass:
         mid_mask = (freqs > 120) & (freqs <= 1000)
         target[mid_mask] = np.interp(freqs[mid_mask], [120, 1000], [1.414, 1.0])
         
-        # Treble roll-off above 1000Hz (-1.5dB per octave)
-        treble_mask = freqs > 1000
-        octaves = np.log2(freqs[treble_mask] / 1000.0)
-        target[treble_mask] = 10 ** (-1.5 * octaves / 20.0)
+        # Gentle treble roll-off above 3kHz (-0.5dB per octave)
+        treble_mask = freqs > 3000
+        octaves = np.log2(freqs[treble_mask] / 3000.0)
+        target[treble_mask] = 10 ** (-0.5 * octaves / 20.0)
         
         # Regularized Inversion (Soft Waterfilling) to avoid boosting noise floor
         reg = 0.02 * np.max(smooth_mag)  # 2% of max magnitude peak
@@ -2064,19 +2521,32 @@ class AudioBypass:
         drive_sig, self._sub_filter_zi['drive'] = sosfilt(self._sub_drive_sos, src, zi=self._sub_filter_zi['drive'])
         vocal_sig, self._sub_filter_zi['vocal'] = sosfilt(self._sub_vocal_sos, src, zi=self._sub_filter_zi['vocal'])
 
-        # 4. Voice Avoidance (stateful smoothing)
+        # 4. Voice Avoidance — asymmetric attack/release so voice onset ducks synth fast
         v_pow = np.mean(vocal_sig**2)
         d_pow = np.mean(drive_sig**2)
-        self._sub_filter_zi['v_avg'] = self._sub_filter_zi['v_avg'] * 0.98 + v_pow * 0.02
-        self._sub_filter_zi['d_avg'] = self._sub_filter_zi['d_avg'] * 0.98 + d_pow * 0.02
+        sr = self.sample_rate
+        frames = N
 
-        vocal_energy = np.sqrt(self._sub_filter_zi['v_avg'])
-        drive_energy = np.sqrt(self._sub_filter_zi['d_avg'])
+        # Vocal energy: fast attack (10ms) so voice is caught immediately, slow release (300ms)
+        v_atk  = 1.0 - math.exp(-frames / (sr * 0.010))
+        v_rel  = 1.0 - math.exp(-frames / (sr * 0.300))
+        v_a    = v_atk if v_pow > self._sub_filter_zi['v_avg'] else v_rel
+        self._sub_filter_zi['v_avg'] = self._sub_filter_zi['v_avg'] * (1.0 - v_a) + v_pow * v_a
+
+        # Drive energy: slow attack (100ms), fast release (50ms) so ratio rises quickly
+        # when bass disappears and voice takes over
+        d_atk  = 1.0 - math.exp(-frames / (sr * 0.100))
+        d_rel  = 1.0 - math.exp(-frames / (sr * 0.050))
+        d_a    = d_atk if d_pow > self._sub_filter_zi['d_avg'] else d_rel
+        self._sub_filter_zi['d_avg'] = self._sub_filter_zi['d_avg'] * (1.0 - d_a) + d_pow * d_a
+
+        vocal_energy = math.sqrt(self._sub_filter_zi['v_avg'])
+        drive_energy = math.sqrt(self._sub_filter_zi['d_avg'])
 
         ratio = vocal_energy / (drive_energy + 1e-6)
-        cutoff = getattr(self, '_sub_drive_cutoff', 80.0)
-        avoid_thresh = np.interp(cutoff, [40.0, 80.0, 200.0], [1.1, 0.9, 0.5])
-        avoid_slope  = np.interp(cutoff, [40.0, 80.0, 200.0], [1.0, 1.5, 2.5])
+        # Flat threshold: vocal filter is always above drive band so ratio is meaningful
+        avoid_thresh = 0.85
+        avoid_slope  = 1.5
         avoidance = float(np.clip(1.0 - (ratio - avoid_thresh) * avoid_slope, 0.0, 1.0))
 
         # 5. Autocorrelation pitch detection on accumulated analysis buffer
@@ -2404,56 +2874,7 @@ class AudioBypass:
 
     def _apply_profile_dict(self, profile):
         """Hydrate current attributes from a profile dictionary structure."""
-        if not profile: profile = {} # Ensure dictionary operations run fallbacks
-        self.upmix_enabled = profile.get("upmix_enabled", False)
-        self.manual_upmix = profile.get("manual_upmix", False)
-        self.lfe_muted = profile.get("lfe_muted", False)
-        self.center_extraction = profile.get("center_extraction", False)
-        self.independent_panning = profile.get("independent_panning", False)
-        self.stage_equalizer = profile.get("stage_equalizer", False)
-        self.gui_panning_x = profile.get("panning_x", 0.0)
-        self.gui_panning_y = profile.get("panning_y", 0.0)
-        self.center_spread = profile.get("center_spread", 0.0)
-        self.side_gain_db = profile.get("side_gain_db", 0.0)
-        self.width_factor = profile.get("width_factor", 1.0)
-        self.dynamic_eq = profile.get("dynamic_eq", False)
-        self.cinema_steering = profile.get("cinema_steering", False)
-        self.gaming_panning = profile.get("gaming_panning", False)
-        self.widening_mode = profile.get("widening_mode", False)
-        self.vocal_lock = profile.get("vocal_lock", False)
-        self.spectral_tilt = profile.get("spectral_tilt", False)
-        self.sub_synth = profile.get("sub_synth", False)
-        self.sub_gain = profile.get("sub_gain", 0.35)
-        setattr(self, "sub_drive_cutoff", profile.get("sub_drive_cutoff", 80.0))
-        setattr(self, "sub_low_cutoff", profile.get("sub_low_cutoff", 20.0))
-        self.transaural_widening = profile.get("transaural_widening", False)
-        self.transaural_delay = profile.get("transaural_delay", 7)
-        self.transaural_gain = profile.get("transaural_gain", 0.35)
-        self.transaural_feedback = profile.get("transaural_feedback", 0.08)
-        self.head_tracking = profile.get("head_tracking", False)
-        self.headphone_tracking = profile.get("headphone_tracking", False)
-        self.head_shadow_eq = profile.get("head_shadow_eq", False)
-        self.head_tracking_preview = profile.get("head_tracking_preview", False)
-        self.speaker_width_cm = profile.get("speaker_width_cm", 60.0)
-        self.camera_fov = profile.get("camera_fov", 70.0)
-        self.speaker_distance_cm = profile.get("speaker_distance_cm", 70.0)
-        self.room_width_m = profile.get("room_width_m", 4.0)
-        self.harmonic_exciter = profile.get("harmonic_exciter", False)
-        self.loudness_norm = profile.get("loudness_norm", False)
-        self.transient_restore = profile.get("transient_restore", False)
-        self.transient_amount = profile.get("transient_amount", 4.0)
-        self.declip = profile.get("declip", False)
-        self.freq_dep_width = profile.get("freq_dep_width", False)
-        self.hp_externalization = profile.get("hp_externalization", False)
-        self.surround_decorrelation = profile.get("surround_decorrelation", False)
-        self.micro_dynamics = profile.get("micro_dynamics", False)
-        self.micro_dyn_amount = profile.get("micro_dyn_amount", 4.0)
-        self.clarity_dsp = profile.get("clarity_dsp", False)
-        self.clarity_amount = profile.get("clarity_amount", 4.0)
-        self.virtual_room = profile.get("virtual_room", False)
-        self.virtual_room_mix = profile.get("virtual_room_mix", 0.25)
-        self.air_exciter = profile.get("air_exciter", False)
-        self.air_amount = profile.get("air_amount", 0.3)
+        apply_profile_to_object(self, profile or {})
 
     def switch_mode(self, new_mode):
         """Serialize current state to cache and load state from new target mode."""
@@ -2461,57 +2882,7 @@ class AudioBypass:
         if new_mode == self.current_mode: return
 
         # 1. Capture Current mode buffer
-        curr_config = {
-            "upmix_enabled": self.upmix_enabled,
-            "manual_upmix": self.manual_upmix,
-            "lfe_muted": self.lfe_muted,
-            "center_extraction": self.center_extraction,
-            "independent_panning": self.independent_panning,
-            "stage_equalizer": self.stage_equalizer,
-            "panning_x": self.gui_panning_x,
-            "panning_y": self.gui_panning_y,
-            "center_spread": self.center_spread,
-            "side_gain_db": self.side_gain_db,
-            "width_factor": self.width_factor,
-            "dynamic_eq": self.dynamic_eq,
-            "cinema_steering": getattr(self, "cinema_steering", False),
-            "gaming_panning": getattr(self, "gaming_panning", False),
-            "widening_mode": self.widening_mode,
-            "vocal_lock": self.vocal_lock,
-            "spectral_tilt": self.spectral_tilt,
-            "sub_synth": self.sub_synth,
-            "sub_gain": self.sub_gain,
-            "sub_drive_cutoff": self.sub_drive_cutoff,
-            "sub_low_cutoff": self.sub_low_cutoff,
-            "transaural_widening": getattr(self, "transaural_widening", False),
-            "transaural_delay": getattr(self, "transaural_delay", 0),
-            "transaural_gain": getattr(self, "transaural_gain", 0.0),
-            "transaural_feedback": getattr(self, "transaural_feedback", 0.08),
-            "head_tracking": getattr(self, "head_tracking", False),
-            "headphone_tracking": getattr(self, "headphone_tracking", False),
-            "speaker_width_cm": getattr(self, "speaker_width_cm", 60.0),
-            "camera_fov": getattr(self, "camera_fov", 70.0),
-            "speaker_distance_cm": getattr(self, "speaker_distance_cm", 70.0),
-            "room_width_m": getattr(self, "room_width_m", 4.0),
-            "head_tracking_preview": getattr(self, "head_tracking_preview", False),
-            "harmonic_exciter": getattr(self, "harmonic_exciter", False),
-            "loudness_norm": getattr(self, "loudness_norm", False),
-            "transient_restore": getattr(self, "transient_restore", False),
-            "transient_amount": getattr(self, "transient_amount", 4.0),
-            "declip": getattr(self, "declip", False),
-            "freq_dep_width": getattr(self, "freq_dep_width", False),
-            "hp_externalization": getattr(self, "hp_externalization", False),
-            "surround_decorrelation": getattr(self, "surround_decorrelation", False),
-            "head_shadow_eq": getattr(self, "head_shadow_eq", False),
-            "micro_dynamics": getattr(self, "micro_dynamics", False),
-            "micro_dyn_amount": getattr(self, "micro_dyn_amount", 4.0),
-            "clarity_dsp": getattr(self, "clarity_dsp", False),
-            "clarity_amount": getattr(self, "clarity_amount", 4.0),
-            "virtual_room": getattr(self, "virtual_room", False),
-            "virtual_room_mix": getattr(self, "virtual_room_mix", 0.25),
-            "air_exciter": getattr(self, "air_exciter", False),
-            "air_amount": getattr(self, "air_amount", 0.3),
-        }
+        curr_config = build_profile_from_object(self)
 
 
         if self.current_mode == "speakers":
@@ -2536,56 +2907,15 @@ class AudioBypass:
         target = path or self.config_file
         
         # 1. Update Active state into current cached mode dictionary
-        active_config = {
-            "upmix_enabled": self.upmix_enabled,
-            "manual_upmix": self.manual_upmix,
-            "lfe_muted": self.lfe_muted,
-            "center_extraction": self.center_extraction,
-            "independent_panning": self.independent_panning,
-            "stage_equalizer": self.stage_equalizer,
-            "panning_x": self.gui_panning_x,
-            "panning_y": self.gui_panning_y,
-            "center_spread": self.center_spread,
-            "side_gain_db": self.side_gain_db,
-            "width_factor": self.width_factor,
-            "dynamic_eq": self.dynamic_eq,
-            "cinema_steering": getattr(self, "cinema_steering", False),
-            "gaming_panning": getattr(self, "gaming_panning", False),
-            "widening_mode": self.widening_mode,
-            "vocal_lock": self.vocal_lock,
-            "spectral_tilt": self.spectral_tilt,
-            "sub_synth": self.sub_synth,
-            "sub_gain": self.sub_gain,
-            "sub_drive_cutoff": self.sub_drive_cutoff,
-            "sub_low_cutoff": self.sub_low_cutoff,
-            "transaural_widening": getattr(self, "transaural_widening", False),
-            "transaural_delay": getattr(self, "transaural_delay", 0),
-            "transaural_gain": getattr(self, "transaural_gain", 0.0),
-            "transaural_feedback": getattr(self, "transaural_feedback", 0.08),
-            "head_tracking": getattr(self, "head_tracking", False),
-            "headphone_tracking": getattr(self, "headphone_tracking", False),
-            "speaker_width_cm": getattr(self, "speaker_width_cm", 60.0),
-            "camera_fov": getattr(self, "camera_fov", 70.0),
-            "speaker_distance_cm": getattr(self, "speaker_distance_cm", 70.0),
-            "room_width_m": getattr(self, "room_width_m", 4.0),
-            "head_tracking_preview": getattr(self, "head_tracking_preview", False),
-            "harmonic_exciter": getattr(self, "harmonic_exciter", False),
-            "loudness_norm": getattr(self, "loudness_norm", False),
-            "transient_restore": getattr(self, "transient_restore", False),
-            "transient_amount": getattr(self, "transient_amount", 4.0),
-            "declip": getattr(self, "declip", False),
-            "freq_dep_width": getattr(self, "freq_dep_width", False),
-            "hp_externalization": getattr(self, "hp_externalization", False),
-            "surround_decorrelation": getattr(self, "surround_decorrelation", False),
-            "head_shadow_eq": getattr(self, "head_shadow_eq", False),
-            "micro_dynamics": getattr(self, "micro_dynamics", False),
-            "micro_dyn_amount": getattr(self, "micro_dyn_amount", 4.0),
-        }
+        active_config = build_profile_from_object(self)
 
         if self.current_mode == "speakers":
             self.speakers_config = active_config
         else:
             self.headphones_config = active_config
+
+        adaptive_state = build_adaptive_state_from_object(self)
+        secondary_output_state = build_secondary_output_state_from_object(self)
 
         # 2. Package Multi-Profile Data For File
         data = {
@@ -2598,6 +2928,8 @@ class AudioBypass:
             "webcam_device": getattr(self, "webcam_name", ""),
             "webcam_index": getattr(self, "webcam_index", 0),
             "bypass_all": getattr(self, "bypass_all", False),
+            "secondary_output": secondary_output_state,
+            **adaptive_state,
         }
         try:
             with open(target, 'w') as f:
@@ -2615,14 +2947,45 @@ class AudioBypass:
                 self.current_mode = data.get("current_mode", "speakers")
                 self.speakers_config = data.get("speakers", {})
                 self.headphones_config = data.get("headphones", {})
+                self.input_name = data.get("input_device", self.input_name)
+                self.output_name = data.get("output_device", self.output_name)
+                self.webcam_name = data.get("webcam_device", getattr(self, "webcam_name", ""))
+                self.webcam_index = data.get("webcam_index", getattr(self, "webcam_index", 0))
                 self.bypass_all = data.get("bypass_all", getattr(self, "bypass_all", False))
+                apply_adaptive_state_to_object(self, data)
+
+                secondary_output_state = data.get("secondary_output", {})
+                if not secondary_output_state:
+                    secondary_output_state = {
+                        key: data[key]
+                        for key in (
+                            "secondary_output_enabled",
+                            "secondary_output_device",
+                            "secondary_output_gain_db",
+                            "secondary_output_lowpass_hz",
+                            "secondary_output_highpass_hz",
+                            "secondary_output_delay_ms",
+                            "secondary_output_source_mode",
+                            "secondary_output_mono_sum",
+                        )
+                        if key in data
+                    }
+                apply_secondary_output_state_to_object(self, secondary_output_state)
 
                 # Mic processing global settings removed as the feature is deprecated
 
                 # --- Backward Compatibility ---
                 # If loading an OLD flat format config.json, populate the speakers config with it!
                 if "upmix_enabled" in data and not self.speakers_config:
-                    self.speakers_config = { k: data[k] for k in data if k not in ("current_mode", "speakers", "headphones", "input_device", "output_device", "bypass_all") }
+                    legacy_excluded = {
+                        "current_mode", "speakers", "headphones", "input_device", "output_device",
+                        "webcam_device", "webcam_index", "bypass_all", "adaptive_monitor_enabled",
+                        "adaptive_observe_only", "adaptive_mode", "adaptive_profile", "adaptive_compare_bypass",
+                        "secondary_output", "secondary_output_enabled", "secondary_output_device",
+                        "secondary_output_gain_db", "secondary_output_lowpass_hz", "secondary_output_highpass_hz",
+                        "secondary_output_delay_ms", "secondary_output_source_mode", "secondary_output_mono_sum",
+                    }
+                    self.speakers_config = {k: data[k] for k in data if k not in legacy_excluded}
                 
                 # Load active profile state values
                 active_profile = self.speakers_config if self.current_mode == "speakers" else self.headphones_config
@@ -2634,6 +2997,7 @@ class AudioBypass:
             is_tracking_active = getattr(self, 'head_tracking', False) or getattr(self, 'headphone_tracking', False)
             if is_tracking_active:
                 self.start_head_tracker()
+            self.refresh_secondary_output_filters()
         except Exception as e:
             print(f"Failed to load config: {e}")
 
@@ -2692,9 +3056,11 @@ class AudioBypass:
             self.head_tracker = None
             print("Head Tracker offline.")
 
-    def change_devices(self, in_name, out_name):
+    def change_devices(self, in_name, out_name, secondary_out_name=None):
         self.input_name = in_name
         self.output_name = out_name
+        if secondary_out_name is not None:
+            self.secondary_output_device = secondary_out_name
         self.save_config()
         
         # Stop streams securely
@@ -2706,6 +3072,7 @@ class AudioBypass:
             try: self.output_stream.stop(); self.output_stream.close()
             except Exception: pass
             self.output_stream = None
+        self.close_secondary_output_stream()
             
         import time
         time.sleep(0.2)
@@ -2714,11 +3081,15 @@ class AudioBypass:
         self.input_device_id, self.max_input_ch, self.input_rate = self._find_device(self.input_name, is_input=True)
         self.output_device_id, self.max_output_ch, self.output_rate = self._find_device(self.output_name, is_input=False)
         self.sample_rate = int(self.output_rate)
+        self.secondary_output_target_latency_samples = int(self.sample_rate * 0.040)
+        self.secondary_output_ring_buffer_size = int(self.sample_rate * 0.25)
+        self.refresh_secondary_output_filters()
         
         # Reboot streams
         self.current_channels = 2 # reset
         self.open_input_stream()
         self.open_output_stream(self.max_output_ch)
+        self.refresh_secondary_output_stream()
 
     # ════════════════════════════════════════════════════════════════════
     #  MICROPHONE PROCESSING
@@ -2953,12 +3324,7 @@ class AudioBypass:
 
             # ─── Post-Upmix Effects Pipeline ───
             self._apply_post_effects(out_block, out_block.shape[1], skip_subsynth=force_passthrough, src_block=src_block, is_passthrough=True)
-
-            # Global Master Soft-Clipper (All channels)
-            threshold = 0.82
-            mask = np.abs(out_block) > threshold
-            if np.any(mask):
-                out_block[mask] = np.sign(out_block[mask]) * (threshold + (1 - threshold) * np.tanh((np.abs(out_block[mask]) - threshold) / (1 - threshold)))
+            out_block[:, :] = self._apply_true_peak_limiter(out_block)
 
             return out_block
 
@@ -3081,13 +3447,14 @@ class AudioBypass:
                  # (unity_active, cinema_active, gap_active already set above)
 
                  # Map coeffs per-bin
+                 adaptive_width_factor = self._adaptive_value('width_factor', self.width_factor)
                  if cinema_active:
                      side_angle_cin = (1.0 - cn) * (math.pi / 2.0)
                      front_scale = np.cos(side_angle_cin)
                      rear_scale = np.sin(side_angle_cin)
                      center_steering_gain = np.clip((cn - 0.5) * 2.0, 0, 1)
                      phantom_mid = Mid_fft * (1.0 - center_steering_gain)
-                     target_width_raw = self.width_factor
+                     target_width_raw = adaptive_width_factor
                      side_boost = 1.0
                  elif unity_active:
                      m_angle = (1.0 - cn) * (math.pi / 2.0)
@@ -3096,14 +3463,14 @@ class AudioBypass:
                      side_angle = cn * (math.pi / 4.0)
                      front_scale = np.cos(side_angle)
                      rear_scale = np.sin(side_angle)
-                     target_width_raw = self.width_factor
+                     target_width_raw = adaptive_width_factor
                      side_boost = 1.0
                  else:
                      front_scale = np.full_like(cn, (self.gui_panning_y + 1.0) / 2.0)
                      rear_scale = 1.0 - front_scale
                      center_steering_gain = np.full_like(cn, 1.0 - self.center_spread)
                      phantom_mid = Mid_fft * (1.0 - center_steering_gain)
-                     target_width_raw = self.width_factor
+                     target_width_raw = adaptive_width_factor
                      side_boost = 10 ** (self.side_gain_db / 20.0)
 
                  # P3: Apply per-band steering bias (skip for gaming panning — needs coherent point sources)
@@ -3118,8 +3485,8 @@ class AudioBypass:
                      self._spec_width_smooth = self._spec_width_smooth * 0.8 + float(target_width_raw) * 0.2
                  target_width = self._spec_width_smooth
 
-                 # P6: Band-limited center extraction (300Hz–3kHz)
-                 center_band = np.clip((freq_hz - 300) / 100, 0, 1) * np.clip((3000 - freq_hz) / 500, 0, 1)
+                 # P6: Band-limited center extraction (200Hz–8kHz)
+                 center_band = np.clip((freq_hz - 200) / 100, 0, 1) * np.clip((8000 - freq_hz) / 1000, 0, 1)
                  if self.center_extraction:
                      Center_fft = Mid_fft * center_steering_gain * center_band
                      # Route out-of-band center energy back to FL/FR
@@ -3233,12 +3600,8 @@ class AudioBypass:
 
              # ─── Post-Upmix Effects Pipeline ───
              self._apply_post_effects(out_block, out_ch, src_block=src_block)
-             # Global Master Soft-Clipper (All channels)
-             threshold = 0.82
-             mask = np.abs(out_block) > threshold
-             if np.any(mask):
-                 out_block[mask] = np.sign(out_block[mask]) * (threshold + (1 - threshold) * np.tanh((np.abs(out_block[mask]) - threshold) / (1 - threshold)))
- 
+             out_block[:, :] = self._apply_true_peak_limiter(out_block)
+
              return out_block
 
         # 1. Base Mid/Side Extraction (Reference Frame)
@@ -3273,7 +3636,8 @@ class AudioBypass:
 
         # Applied values stacked over sliders (or auto-pilot)
         ratio_z = getattr(self, '_dynamic_width_ratio', 1.0)
-        applied_width = max(0.5, min(2.0, (self.width_factor * ratio_z) + (0.0 if (unity_active or cinema_active) else dyn_width_offset)))
+        width_factor = self._adaptive_value('width_factor', self.width_factor)
+        applied_width = max(0.5, min(2.0, (width_factor * ratio_z) + (0.0 if (unity_active or cinema_active) else dyn_width_offset)))
         applied_spread = max(0.0, min(1.0, self.center_spread + (0.0 if (unity_active or cinema_active) else dyn_spread_offset)))
 
         if unity_active:
@@ -3281,13 +3645,13 @@ class AudioBypass:
              m_angle = (1.0 - current_narrow) * (math.pi / 2.0)
              center_gain = math.cos(m_angle)
              phantom_gain = math.sin(m_angle) / 1.414
-             target_width = self.width_factor
+             target_width = width_factor
         elif cinema_active:
              # Cinema Steering: Center tapers off as signal becomes panned
              center_steering_gain = max(0.0, (current_narrow - 0.5) * 2.0)
              center_gain = center_steering_gain
              phantom_gain = 1.0 - center_steering_gain
-             target_width = self.width_factor
+             target_width = width_factor
         else:
              center_gain = 1.0 - applied_spread
              phantom_gain = applied_spread
@@ -3392,8 +3756,9 @@ class AudioBypass:
         # If center_extraction is false, we kill the center channel entirely 
         # and fold EVERYTHING back (already handled by phantom_mid if spread is 1.0)
         # but if extraction is on, we use the center_signal.
-        Center = center_signal if self.center_extraction else 0.0
-        if not self.center_extraction:
+        center_extraction_active = self.center_extraction
+        Center = center_signal if center_extraction_active else 0.0
+        if not center_extraction_active:
             # Re-re-fold if extraction is manually disabled (Legacy toggle support)
             FL += center_signal * 0.5
             FR += center_signal * 0.5
@@ -3543,6 +3908,8 @@ class AudioBypass:
         # Note: src_block is a view into the pre-allocated buffer. 
         # Upmix processes it and writes to its own pre-allocated output buffer.
         outdata[:] = self._apply_upmix(src_block, out_ch=outdata.shape[1])
+        if getattr(self, 'secondary_output_enabled', False) and self.secondary_output_stream:
+            self._enqueue_secondary_output_block(self._build_secondary_output_block(outdata, src_block=src_block))
 
         # Capture mono downmix for AEC reference (outside buffer_lock would race,
         # but this is a simple read of outdata we just wrote — safe here)
@@ -3571,6 +3938,7 @@ class AudioBypass:
             # Start with the hardware's native channel count for stability
             target_channels = self.max_output_ch if not self.simulation else 8
             self.open_output_stream(target_channels)
+            self.refresh_secondary_output_stream()
 
             # Start mic processing streams if enabled and devices configured
             if getattr(self, 'mic_enabled', False):
