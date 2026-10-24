@@ -147,15 +147,23 @@ def test_hp_externalization_keeps_mono_bass_level(engine):
     assert -1.5 < gain_db < 2.0
 
 
-def test_passthrough_lfe_redirect_is_bounded_and_low_passed(engine):
+def test_lfe_redirect_is_the_original_full_band_formula(engine):
+    """Sub feed = content LFE + all mains * 0.316 (passthrough) or (L+R) * 0.316
+    (upmix), full band and phase-exact: band-limiting and alignment are done
+    downstream by the user's room correction."""
+    la = int(0.0015 * SR)                                         # limiter look-ahead
+    x = (np.random.default_rng(4).standard_normal((SR, 8)) * 0.05).astype(np.float32)
     engine.is_multichannel_detected = True
-    t = np.arange(4800) / SR
-    hf = (0.8 * np.sin(2 * np.pi * 3000 * t)).astype(np.float32)
-    src = np.repeat(hf[:, None], 8, axis=1)
-    src[:, 3] = 0.0
-    lfe = np.concatenate([engine._apply_upmix(src[i:i + 480], out_ch=8)[:, 3].copy() for i in range(0, 4800, 480)])
-    assert np.max(np.abs(lfe[2400:])) < 0.01  # 3 kHz content does not reach the sub
+    out = np.concatenate([engine._apply_upmix(x[i:i + 480].copy(), out_ch=8).copy() for i in range(0, SR, 480)])
+    mains = [0, 1, 2, 4, 5, 6, 7]
+    np.testing.assert_allclose(out[la:, 3], (x[:, 3] + x[:, mains].sum(axis=1) * 0.316)[:-la], atol=1e-6)
 
+    engine.is_multichannel_detected = False
+    engine.upmix_enabled = True
+    x[:, 2:] = 0.0
+    out = np.concatenate([engine._apply_upmix(x[i:i + 480].copy(), out_ch=8).copy() for i in range(0, SR, 480)])
+    tail = slice(SR // 2, SR)
+    np.testing.assert_allclose(out[la:, 3][tail], ((x[:, 0] + x[:, 1]) * 0.316)[:-la][tail], atol=1e-6)
 
 def test_dynamic_eq_boosts_bass_at_low_level(engine):
     engine.dynamic_eq = True

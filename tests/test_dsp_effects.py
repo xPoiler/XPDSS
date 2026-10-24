@@ -316,12 +316,12 @@ def test_lfe_redirect_and_mute(engine):
     s = tone(60, 0.5) + tone(2000, 0.5)
     out = upmix(engine, src8(s, s))
     tail = slice(SR // 4, SR // 2)
-    assert level_db(out[tail, 3], 60) > -20
-    assert level_db(out[tail, 3], 2000) < level_db(out[tail, 3], 60) - 40
+    # full band (L+R) * 0.316: no filtering in the app, the room correction does it
+    for f in (60, 2000):
+        assert level_db(out[tail, 3], f) == pytest.approx(level_db(s[tail], f) + 20 * np.log10(0.632), abs=0.2)
     engine.lfe_muted = True
     la = int(0.0015 * SR)  # limiter look-ahead still holds the previous run's tail
     assert not upmix(engine, src8(s, s))[la:, 3].any()
-
 
 def test_widening_mode_feeds_delayed_mid_to_surrounds(engine):
     configure_upmix(engine, center_spread=1.0, gui_panning_y=-1.0, widening_mode=True)

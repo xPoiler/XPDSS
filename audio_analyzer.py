@@ -315,9 +315,6 @@ class AudioBypass:
         self._air_hp_sos = None
         self._air_hp_zi = {}
 
-        # LFE redirection low-pass (keeps the bass-redirect full-band free)
-        self._lfe_lp_zi = {}
-
         # ─── Program Level Estimator (always-on, no toggle) ──────────────
         # Very slow RMS tracker that all dynamics processors use as a reference
         # so their thresholds adapt to whatever volume the signal arrives at.
@@ -1068,7 +1065,7 @@ class AudioBypass:
         self._tilt_taps = None
         self._tilt_update_cnt = 0
         for store in ('_tilt_filter_zi', '_sub_filter_zi', '_loudness_filter_zi', '_clarity_zi',
-                      '_room_lp_zi', '_air_hp_zi', '_lfe_lp_zi'):
+                      '_room_lp_zi', '_air_hp_zi'):
             setattr(self, store, {})
         if hasattr(self, '_clarity_mud_zi'):
             self._clarity_mud_zi = {}
@@ -1204,9 +1201,6 @@ class AudioBypass:
         lo_elev = 6000.0 / (sr / 2)
         if lo_elev < hi_elev:
             self._elev_bp_sos = butter(2, [lo_elev, hi_elev], btype='band', output='sos')
-
-        # LFE redirection low-pass (bass sent to the sub must be band-limited)
-        self._lfe_lp_sos = butter(4, 120.0 / (sr / 2), btype='low', output='sos')
 
         # Dialogue presence band (1.5-4 kHz) for Dialog Focus
         self._dlg_bp_sos = butter(2, [1500.0 / (sr / 2), min(0.95, 4000.0 / (sr / 2))], btype='bandpass', output='sos')
@@ -3479,7 +3473,7 @@ class AudioBypass:
         if mode == 'pass':
             self._route_passthrough(src_block, out_block, out_ch)
         elif mode == 'pass_d':
-            self._route_passthrough(self._spec_delayed_src, out_block, out_ch, lfe_key='pass_d')
+            self._route_passthrough(self._spec_delayed_src, out_block, out_ch)
         elif mode == 'spectral':
             self._route_spectral(out_block, out_ch)
         else:
@@ -3547,10 +3541,10 @@ class AudioBypass:
         if out_ch > 2:
             out_block[:, 2] = dc * (0.707 if self.stage_equalizer else 1.0)
 
-        # LFE: identical to the classic upmix (low-passed L+R at -10 dB), on
-        # the delayed input so it stays aligned with the spectral output.
+        # LFE: identical to the classic upmix (L+R at -10 dB), on the delayed
+        # input so it stays aligned with the spectral output.
         if out_ch > 3:
-            lfe = self._lfe_lowpass((d_src[:, 0] + d_src[:, 1]) * 0.316, key='spectral')
+            lfe = (d_src[:, 0] + d_src[:, 1]) * 0.316
             if getattr(self, 'dynamic_eq', False):
                 safe_level = max(getattr(self, 'dyn_eq_level', 0.0), float(np.max(np.abs(d_src))))
                 boost_factor = 1.0 + (1.0 - min(1.0, safe_level * 2.0)) * 0.58
@@ -3603,15 +3597,18 @@ class AudioBypass:
                     target = 0 if is_left else 1
                 out_block[:, target] += 0.707 * sig
 
-    def _route_passthrough(self, src_block, out_block, out_ch, lfe_key='pass'):
+    def _route_passthrough(self, src_block, out_block, out_ch):
         """Discrete channels 1:1, extra channels downmixed, bass redirect to LFE."""
         frames, in_ch = src_block.shape
         limit = min(in_ch, out_ch)
         out_block[:, :limit] = src_block[:, :limit]
         self._downmix_extra_channels(src_block, out_block, out_ch)
 
-        # Double Bass: all mains summed and redirected to the LFE at -10 dB
-        # (low-passed). Summing every main channel is deliberate: a 5.1/7.1 mix
+        # Double Bass: all mains summed and redirected to the LFE at -10 dB,
+        # full band: band-limiting and sub/main alignment are done downstream
+        # (room correction); filtering here shifted the sub's phase against the
+        # mains and weakened the summed bass. Summing every main channel is
+        # deliberate: a 5.1/7.1 mix
         # then sends the same bass to the sub as its stereo version does
         # through the upmix ((L+R) * 0.316), so the sub level is consistent
         # between the two modes. Peaks above full scale are handled by the
@@ -3623,7 +3620,7 @@ class AudioBypass:
             else:
                 mains_sum = np.zeros(frames, dtype=np.float32)
             lfe_original = src_block[:, 3] if in_ch > 3 else 0.0
-            out_block[:, 3] = lfe_original + self._lfe_lowpass(mains_sum, key=lfe_key)
+            out_block[:, 3] = lfe_original + mains_sum
 
         # Apply Safe Dynamic EQ if enabled and LFE exists (Stereo passthrough won't have out_ch > 3)
         if out_ch > 3 and getattr(self, 'dynamic_eq', False):
@@ -3823,8 +3820,8 @@ class AudioBypass:
             if BL is not None:
                 BL, BR = self._apply_surround_decorrelation(BL, BR)
 
-        # Consistent Sub Level: low-passed L+R redirected at -10dB (0.316)
-        LFE = self._lfe_lowpass((L + R) * 0.316, key='upmix')
+        # Consistent Sub Level: L+R redirected at -10dB (0.316), full band (see passthrough)
+        LFE = (L + R) * 0.316
         
         # Apply Safe Dynamic EQ if enabled
         # Adds up to +4dB (1.58x) boost at extreme low volumes, tapering to 0dB at 0.5 peak
@@ -3854,14 +3851,6 @@ class AudioBypass:
             else:
                 if i % 2 == 0: out_block[:, i] = SL
                 else: out_block[:, i] = SR
-
-    def _lfe_lowpass(self, sig, key='lfe'):
-        """120 Hz low-pass for bass redirected to the LFE channel (stateful per route)."""
-        if getattr(self, '_lfe_lp_sos', None) is None:
-            self._init_multiband_filters()
-        zi = self._ensure_sos_zi(self._lfe_lp_zi, key, self._lfe_lp_sos)
-        out, self._lfe_lp_zi[key] = sosfilt(self._lfe_lp_sos, sig, zi=zi)
-        return out.astype(np.float32)
 
     def _read_input_block(self, frames):
         """Pull `frames` samples from the input ring buffer (None on underrun).
