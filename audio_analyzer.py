@@ -1048,7 +1048,7 @@ class AudioBypass:
 
     # Lazily created DSP state that depends on sample rate, block size or channel count
     _DSP_STATE_ATTRS = (
-        '_limiter_buffer', '_limiter_gr_zi', '_tilt_taps', '_tilt_hist',
+        '_limiter_buffer', '_limiter_gr_zi', '_limiter_req_hist', '_tilt_taps', '_tilt_hist',
         '_fdw_lo_sos', '_fdw_hi_sos', '_fdw_zi',
         '_ext_xfeed_sos', '_ext_delay_buf',
         '_exciter_lp_sos', '_exciter_dc_zi',
@@ -2868,39 +2868,50 @@ class AudioBypass:
 
         The gain is the running minimum of the required gain over a 1.5 ms
         look-ahead window (so it is already down when the peak arrives),
-        with instant attack and a 60 ms release. The same gain is applied to
-        all channels (no image shift). Rebuilds itself when the channel count,
-        block size or sample rate changes.
+        with instant attack and a 60 ms release. All main channels share one
+        gain (no image shift); the LFE channel (index 3) is limited on its
+        own, so a sub-channel peak never turns down dialogue and music.
+        Rebuilds itself when the channel count, block size or sample rate
+        changes.
         """
         n, ch = block.shape
         if n == 0:
             return block
         threshold = 0.98
         look_ahead = max(1, int(0.0015 * self.sample_rate))
+        if ch > 3:
+            groups = [[c for c in range(ch) if c != 3], [3]]
+        else:
+            groups = [list(range(ch))]
+        n_groups = len(groups)
         if (self._limiter_buffer is None or self._limiter_buffer.shape != (look_ahead, ch)
-                or not hasattr(self, '_limiter_gr_zi')):
+                or getattr(self, '_limiter_req_hist', np.zeros((0, 0))).shape != (look_ahead, n_groups)):
             self._limiter_buffer = np.zeros((look_ahead, ch), dtype=np.float32)
-            self._limiter_req_hist = np.ones(look_ahead, dtype=np.float64)
-            self._limiter_gr_zi = np.zeros((1, 1), dtype=np.float64)
+            self._limiter_req_hist = np.ones((look_ahead, n_groups), dtype=np.float64)
+            self._limiter_gr_zi = np.zeros((1, n_groups), dtype=np.float64)
 
         combined = np.concatenate((self._limiter_buffer, block), axis=0)  # (la + n, ch)
         self._limiter_buffer = combined[n:].copy()
 
-        peak = np.max(np.abs(combined[look_ahead:]), axis=1).astype(np.float64)
+        new_abs = np.abs(combined[look_ahead:]).astype(np.float64)
+        peak = np.stack([new_abs[:, g].max(axis=1) for g in groups], axis=1)      # (n, groups)
         req_new = np.minimum(1.0, threshold / np.maximum(peak, 1e-9))
         req = np.concatenate((self._limiter_req_hist, req_new))  # aligned with `combined`
         self._limiter_req_hist = req[n:].copy()
 
         # Output sample i is combined[i]; its gain must cover samples i..i+la
-        windows = np.lib.stride_tricks.sliding_window_view(req, look_ahead + 1)
-        g_min = windows.min(axis=1)[:n]
+        windows = np.lib.stride_tricks.sliding_window_view(req, look_ahead + 1, axis=0)
+        g_min = windows.min(axis=-1)[:n]                                          # (n, groups)
 
         release = math.exp(-1.0 / (self.sample_rate * 0.060))
-        gr = (1.0 - g_min).reshape(-1, 1)
+        gr = 1.0 - g_min
         gr_env, self._limiter_gr_zi = self._asym_env_decimated(gr, 0.0, release, self._limiter_gr_zi)
-        gain = 1.0 - np.maximum(gr_env[:, 0], gr[:, 0])
+        group_gain = 1.0 - np.maximum(gr_env, gr)
 
-        out = combined[:n] * gain[:, np.newaxis].astype(np.float32)
+        gain = np.empty((n, ch), dtype=np.float32)
+        for gi, g in enumerate(groups):
+            gain[:, g] = group_gain[:, gi:gi + 1]
+        out = combined[:n] * gain
         # Absolute safety (only reached by numerical edge cases)
         np.clip(out, -1.0, 1.0, out=out)
         return out
@@ -3600,15 +3611,16 @@ class AudioBypass:
         out_block[:, :limit] = src_block[:, :limit]
         self._downmix_extra_channels(src_block, out_block, out_ch)
 
-        # Double Bass: low-passed mains redirected to the LFE at -10 dB.
-        # Normalised by the number of active mains so a loud discrete
-        # 7.1 mix does not sum to several times full scale.
+        # Double Bass: all mains summed and redirected to the LFE at -10 dB
+        # (low-passed). Summing every main channel is deliberate: a 5.1/7.1 mix
+        # then sends the same bass to the sub as its stereo version does
+        # through the upmix ((L+R) * 0.316), so the sub level is consistent
+        # between the two modes. Peaks above full scale are handled by the
+        # output limiter.
         if out_ch > 3:
             other_channels = [i for i in range(in_ch) if i != 3]
             if other_channels:
-                mains = src_block[:, other_channels]
-                active = int(np.count_nonzero(np.max(np.abs(mains), axis=0) > 1e-4))
-                mains_sum = np.sum(mains, axis=1) * (0.316 * 2.0 / max(2, active))
+                mains_sum = np.sum(src_block[:, other_channels], axis=1) * 0.316
             else:
                 mains_sum = np.zeros(frames, dtype=np.float32)
             lfe_original = src_block[:, 3] if in_ch > 3 else 0.0

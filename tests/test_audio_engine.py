@@ -377,3 +377,15 @@ def test_effects_use_the_live_adaptive_value(engine):
     engine._apply_virtual_room(b)
     engine._apply_virtual_room(b)
     assert np.max(np.abs(b - ref)) > 1e-3                 # adaptive mix 0.3 -> reflections
+
+
+
+def test_lfe_peaks_are_limited_without_ducking_the_mains(engine):
+    t = np.arange(4800) / SR
+    block = np.zeros((4800, 8), dtype=np.float32)
+    block[:, 0] = 0.3 * np.sin(2 * np.pi * 1000 * t)          # dialogue level
+    block[:, 3] = 1.8 * np.sin(2 * np.pi * 40 * t)            # sub overload
+    out = np.concatenate([engine._apply_true_peak_limiter(block[i:i + 480]) for i in range(0, 4800, 480)])
+    la = int(0.0015 * SR)
+    np.testing.assert_allclose(out[la:, 0], block[:-la, 0], atol=1e-6)   # mains untouched
+    assert np.max(np.abs(out[:, 3])) <= 0.9801                            # sub limited

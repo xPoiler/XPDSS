@@ -561,3 +561,30 @@ def test_headphone_tracking_counter_rotation_applies_on_stereo_output(engine):
                           for i in range(0, len(s), BLOCK)])
     tail = slice(SR // 4, SR // 2)
     assert rms_db(out[tail, 0]) < rms_db(out[tail, 1]) - 3.0
+
+
+
+def test_sub_level_is_consistent_between_passthrough_and_upmix(tmp_path):
+    """A 5.1 mix in passthrough must send the same bass to the sub as its
+    stereo downmix does through the upmix (user calibration)."""
+    t = np.arange(SR * 2) / SR
+    mix51 = np.zeros((SR * 2, 8), dtype=np.float32)
+    for ch, ph in ((0, 0.0), (1, 0.3), (2, 0.1), (4, 0.6), (5, 0.9)):
+        mix51[:, ch] = 0.15 * np.sin(2 * np.pi * 55 * t + ph)
+    stereo_dm = np.zeros_like(mix51)
+    stereo_dm[:, 0] = mix51[:, 0] + 0.707 * mix51[:, 2] + 0.707 * mix51[:, 4]
+    stereo_dm[:, 1] = mix51[:, 1] + 0.707 * mix51[:, 2] + 0.707 * mix51[:, 5]
+
+    levels = {}
+    for name, src, detected, spectral in (("upmix", stereo_dm, False, False),
+                                          ("spectral", stereo_dm, False, True),
+                                          ("passthrough", mix51, True, False)):
+        e = aa.AudioBypass("a", "b", simulation=True, config_file=str(tmp_path / f"{name}.json"))
+        e.current_channels = 8
+        e.upmix_enabled = True
+        e.spectral_upmix = spectral
+        e.is_multichannel_detected = detected
+        out = upmix(e, src)
+        levels[name] = rms_db(out[SR:, 3])
+    assert levels["passthrough"] == pytest.approx(levels["upmix"], abs=1.0)
+    assert levels["spectral"] == pytest.approx(levels["upmix"], abs=1.0)
