@@ -461,6 +461,12 @@ class UpmixerWindow(QMainWindow):
         button_groups = [
             ("UPMIX ENGINE", [
                 ("I/O (MANUAL)", "manual_upmix", "Force upmixing ON even for surround sources."),
+                ("SPECTRAL UPMIX", "spectral_upmix",
+                 "Frequency-domain upmix: each source is placed across L/C/R from its own\n"
+                 "position in the mix, only ambience goes to the surrounds.\n"
+                 "Off = classic upmix (A/B). Adds 21 ms latency while selected.\n"
+                 "Center Spread = phantom vs. dedicated center, Width = front stage width,\n"
+                 "Side Gain = surround ambience level, radar Y = ambience front/rear balance."),
                 ("STAGE EQUALIZER", "stage_equalizer", "Balance front/surround weight."),
                 ("CENTER FOCUS", "center_extraction", "Extract dialogue to center speaker."),
                 ("CINEMA STEERING", "cinema_steering", "Phase-detector surround steering."),
@@ -906,7 +912,9 @@ class UpmixerWindow(QMainWindow):
         is_spk = (current_mode == 'speakers')
         is_hp = (current_mode == 'headphones')
 
-        is_cinema = getattr(app, 'cinema_steering', False)
+        is_spectral = getattr(app, 'spectral_upmix', False)
+        # Cinema / gaming steering belong to the classic engine only
+        is_cinema = getattr(app, 'cinema_steering', False) and not is_spectral
         ch = app.max_output_ch
         is_stereo = (ch <= 2)
         is_bypass = getattr(app, 'bypass_all', False)
@@ -960,7 +968,7 @@ class UpmixerWindow(QMainWindow):
         if is_stereo:
             self.btn_master.setEnabled(False)
             self.btn_master.setText("UPMIX (REQ SURROUND)")
-            surround_features = ['center_extraction', 'stage_equalizer', 'cinema_steering', 'gaming_panning', 'vocal_lock', 'lfe_muted']
+            surround_features = ['center_extraction', 'stage_equalizer', 'cinema_steering', 'gaming_panning', 'vocal_lock', 'lfe_muted', 'spectral_upmix']
             for f in surround_features:
                 if f in self.option_buttons:
                     self.option_buttons[f].setEnabled(False)
@@ -972,7 +980,7 @@ class UpmixerWindow(QMainWindow):
              self.btn_master.setVisible(is_spk)
 
         # 4. Mode-exclusive visibility
-        speaker_only = ['transaural_widening', 'cinema_steering', 'gaming_panning', 'stage_equalizer',
+        speaker_only = ['transaural_widening', 'cinema_steering', 'gaming_panning', 'stage_equalizer', 'spectral_upmix',
                         'head_tracking', 'center_extraction', 'lfe_muted', 'vocal_lock', 'freq_dep_width']
         headphone_only = ['head_shadow_eq', 'headphone_tracking', 'hp_externalization']
 
@@ -983,10 +991,12 @@ class UpmixerWindow(QMainWindow):
             if f in self.option_buttons:
                 self.option_buttons[f].setVisible(is_hp)
 
-        # Gaming requires Cinema
+        # Gaming requires Cinema; both only apply to the classic engine
         if 'gaming_panning' in self.option_buttons:
             if is_spk and not is_stereo:
                  self.option_buttons['gaming_panning'].setEnabled(is_cinema)
+        if 'cinema_steering' in self.option_buttons and is_spk and not is_stereo:
+            self.option_buttons['cinema_steering'].setEnabled(not is_spectral)
 
         # 5. Cascading slider visibility
         is_sub = getattr(app, 'sub_synth', False)

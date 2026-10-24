@@ -8,6 +8,7 @@ PROFILE_DEFAULTS: Dict[str, Any] = {
     "lfe_muted": False,
     "center_extraction": False,
     "independent_panning": False,
+    "spectral_upmix": False,  # frequency-domain upmix engine (A/B with the classic one)
     "stage_equalizer": False,
     "panning_x": 0.0,
     "panning_y": 0.0,

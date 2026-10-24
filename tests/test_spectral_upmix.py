@@ -1,0 +1,233 @@
+import time
+
+import numpy as np
+import pytest
+
+import audio_analyzer as aa
+from spectral_upmix import (AMBIENT_L, AMBIENT_R, DIRECT_C, DIRECT_L, DIRECT_R,
+                            SpectralUpmixer)
+
+SR = 48000
+BLOCK = 480
+T = np.arange(SR * 3) / SR
+TAIL = slice(2 * SR, 3 * SR)
+rng = np.random.default_rng(0)
+
+
+def tone(freq, amp=0.2):
+    return amp * np.sin(2 * np.pi * freq * T)
+
+
+def run(x, block=BLOCK, **kw):
+    up = SpectralUpmixer(SR)
+    return np.concatenate([up.process(x[i:i + block], **kw) for i in range(0, len(x), block)])
+
+
+def db(x):
+    return 10 * np.log10(np.mean(np.asarray(x, dtype=np.float64) ** 2) + 1e-20)
+
+
+def band_db(sig, freq):
+    sp = np.abs(np.fft.rfft(sig * np.hanning(len(sig))))
+    fr = np.fft.rfftfreq(len(sig), 1 / SR)
+    return 20 * np.log10(sp[(fr > freq * 0.97) & (fr < freq * 1.03)].max() + 1e-12)
+
+
+def pan(sig, p):
+    """Constant-power stereo pan, p in [-1 (left), +1 (right)]."""
+    th = (p + 1) * np.pi / 4
+    return np.stack([np.cos(th) * sig, np.sin(th) * sig], axis=1)
+
+
+# ── Core processor ──────────────────────────────────────────────────────
+
+def test_reconstruction_is_exact_and_latency_is_fixed():
+    x = rng.standard_normal((SR * 2, 2)) * 0.1
+    out = run(x, center_spread=1.0)
+    lat = SpectralUpmixer(SR).latency
+    assert lat == 1024
+    for ch, (d, a) in enumerate(((DIRECT_L, AMBIENT_L), (DIRECT_R, AMBIENT_R))):
+        np.testing.assert_allclose(out[lat:, d] + out[lat:, a], x[:-lat, ch], atol=1e-9)
+
+
+@pytest.mark.parametrize("block", [441, 512, 1024, 37])
+def test_output_does_not_depend_on_block_size(block):
+    x = rng.standard_normal((SR, 2)) * 0.1
+    np.testing.assert_allclose(run(x, block=block), run(x), atol=1e-12)
+
+
+def test_mono_goes_to_center_only():
+    out = run(pan(tone(440), 0.0))
+    assert db(out[TAIL, DIRECT_C]) > db(out[TAIL, DIRECT_L]) + 60
+    assert db(out[TAIL, AMBIENT_L]) < -100
+
+
+def test_hard_panned_source_stays_in_its_speaker():
+    out = run(pan(tone(440), -1.0))
+    assert db(out[TAIL, DIRECT_L]) > max(db(out[TAIL, DIRECT_C]), db(out[TAIL, DIRECT_R]), db(out[TAIL, AMBIENT_L])) + 60
+
+
+def test_half_left_source_plays_between_left_and_center():
+    out = run(pan(tone(440), -0.5))
+    assert db(out[TAIL, DIRECT_L]) == pytest.approx(db(out[TAIL, DIRECT_C]), abs=0.5)
+    assert db(out[TAIL, DIRECT_R]) < db(out[TAIL, DIRECT_L]) - 60
+
+
+def test_simultaneous_sources_each_land_in_their_own_speaker():
+    x = pan(tone(500), 0.0) + pan(tone(1500), -1.0) + pan(tone(3000), 1.0)
+    out = run(x)
+    for f, ch in ((500, DIRECT_C), (1500, DIRECT_L), (3000, DIRECT_R)):
+        own = band_db(out[TAIL, ch], f)
+        others = [band_db(out[TAIL, c], f) for c in (DIRECT_L, DIRECT_R, DIRECT_C, AMBIENT_L, AMBIENT_R) if c != ch]
+        assert own > max(others) + 40, (f, own, others)
+
+
+def test_diffuse_sound_goes_to_ambience_not_center():
+    x = rng.standard_normal((SR * 3, 2)) * 0.1
+    out = run(x)
+    assert db(out[TAIL, AMBIENT_L]) > db(x[TAIL, 0]) - 2.0
+    assert db(out[TAIL, DIRECT_C]) < db(x[TAIL, 0]) - 12.0
+
+
+def test_vocal_over_ambience_is_separated():
+    amb = rng.standard_normal((SR * 3, 2)) * 0.05
+    out = run(pan(tone(700), 0.0) + amb)
+    assert band_db(out[TAIL, DIRECT_C], 700) > band_db(out[TAIL, AMBIENT_L], 700) + 30
+
+
+@pytest.mark.parametrize("freq", [40, 60, 80, 100, 120])
+def test_bass_is_left_in_the_fronts(freq):
+    x = pan(tone(freq), 0.0)
+    out = run(x)
+    lat = 1024
+    ref = db(x[TAIL, 0])
+    err = out[lat:, DIRECT_L] - x[:-lat, 0]
+    assert db(err[2 * SR - lat:]) < ref - 40       # only window spill-over remains
+    assert db(out[TAIL, DIRECT_C]) < ref - 40
+
+
+def test_width_and_spread_controls():
+    wide = run(pan(tone(440), -0.5), width=2.0)
+    assert db(wide[TAIL, DIRECT_L]) > db(wide[TAIL, DIRECT_C]) + 40      # pushed hard left
+    phantom = run(pan(tone(440), 0.0), center_spread=1.0)
+    assert db(phantom[TAIL, DIRECT_C]) < -100                          # no center
+    no_center = run(pan(tone(440), 0.0), center=False)
+    assert db(no_center[TAIL, DIRECT_C]) < -100
+
+
+def test_stationary_input_gives_stable_output():
+    """No 'musical noise': the level of each stream must not wobble."""
+    amb = rng.standard_normal((SR * 3, 2)) * 0.05
+    out = run(pan(tone(700), 0.0) + pan(tone(1900, 0.1), -0.6) + amb)
+    win = SR // 20
+    for ch in (DIRECT_L, DIRECT_C, AMBIENT_L):
+        seg = out[SR:3 * SR, ch].reshape(-1, win)
+        levels = 10 * np.log10(np.mean(seg ** 2, axis=1))
+        assert np.std(levels) < 0.6, ch
+
+
+def test_transient_has_no_pre_echo():
+    x = np.zeros((SR, 2))
+    x[SR // 2] = 0.8                                        # centered click
+    out = run(x)
+    hit = SR // 2 + 1024
+    total = np.sum(out[:, DIRECT_C] ** 2)
+    assert np.sum(out[:hit - 64, DIRECT_C] ** 2) < 1e-3 * total
+
+
+# ── Engine integration ──────────────────────────────────────────────────
+
+@pytest.fixture
+def engine(tmp_path):
+    app = aa.AudioBypass("a", "b", simulation=True, config_file=str(tmp_path / "c.json"))
+    app.current_channels = 8
+    app.upmix_enabled = True
+    app.center_extraction = True
+    app.spectral_upmix = True
+    return app
+
+
+def render(app, src, out_ch=8, flip=None):
+    outs = []
+    for i in range(0, src.shape[0], BLOCK):
+        if flip:
+            flip(app, i)
+        outs.append(app._apply_upmix(src[i:i + BLOCK].copy(), out_ch=out_ch).copy())
+    return np.concatenate(outs)
+
+
+def src8(stereo):
+    s = np.zeros((stereo.shape[0], 8), dtype=np.float32)
+    s[:, :2] = stereo
+    return s
+
+
+def test_engine_routes_direct_to_front_and_ambience_to_surrounds(engine):
+    amb = rng.standard_normal((SR * 3, 2)) * 0.05
+    out = render(engine, src8(pan(tone(700), 0.0) + amb))
+    tail = slice(2 * SR, 3 * SR)
+    assert band_db(out[tail, 2], 700) > band_db(out[tail, 6], 700) + 30     # vocal: center, not sides
+    for ch in (4, 5, 6, 7):
+        assert db(out[tail, ch]) > -40                                     # ambience reaches all surrounds
+    assert db(out[tail, 6]) > db(out[tail, 4])                              # sides louder than backs
+
+
+def test_engine_5_1_uses_channels_4_5_for_surrounds(engine):
+    engine.current_channels = 6
+    out = render(engine, src8(rng.standard_normal((SR * 2, 2)) * 0.1), out_ch=6)
+    assert db(out[SR:, 4]) > -30 and db(out[SR:, 5]) > -30
+
+
+def test_lfe_level_matches_classic_upmix(engine, tmp_path):
+    x = src8(pan(tone(50, 0.3), 0.0) + pan(tone(70, 0.2), -0.7))
+    spec = render(engine, x)
+    classic = aa.AudioBypass("a", "b", simulation=True, config_file=str(tmp_path / "k.json"))
+    classic.current_channels = 8
+    classic.upmix_enabled = True
+    ref = render(classic, x)
+    lat = 1024
+    np.testing.assert_allclose(spec[SR + lat:, 3], ref[SR:-lat, 3], atol=1e-4)
+
+
+def test_passthrough_is_delayed_to_match_when_spectral_is_selected(engine):
+    engine.is_multichannel_detected = True
+    x = rng.standard_normal((SR, 8)).astype(np.float32) * 0.1
+    out = render(engine, x)
+    la = int(0.0015 * SR) + 1024                                          # limiter + spectral latency
+    np.testing.assert_allclose(out[la:, 0], x[:-la, 0], atol=1e-6)
+
+
+def _max_step_ratio(out, b, ch):
+    normal = max(np.abs(np.diff(out[b - 3000:b - 2, ch])).max(),
+                 np.abs(np.diff(out[b + 3000:b + 8000, ch])).max())
+    return np.abs(np.diff(out[b - 2:b + 2400, ch])).max() / normal
+
+
+def test_auto_switch_between_passthrough_and_spectral_is_seamless(engine):
+    x = src8(pan(tone(300), -0.3) + pan(tone(900), 0.4))
+    x[:, 2] = tone(1200)[:x.shape[0]]
+    flip = lambda app, i: setattr(app, 'is_multichannel_detected', i >= SR * 3 // 2)
+    out = render(engine, x, flip=flip)
+    b = SR * 3 // 2 + int(0.0015 * SR)
+    for ch in (0, 1, 2):
+        assert _max_step_ratio(out, b, ch) <= 1.05
+
+
+def test_ab_toggle_between_engines_is_crossfaded(engine):
+    x = src8(pan(tone(300), -0.3) + pan(tone(900), 0.4) + rng.standard_normal((SR * 3, 2)) * 0.02)
+    flip = lambda app, i: setattr(app, 'spectral_upmix', i < SR * 3 // 2)
+    out = render(engine, x, flip=flip)
+    b = SR * 3 // 2 + int(0.0015 * SR)
+    for ch in (0, 1, 2):
+        assert _max_step_ratio(out, b, ch) <= 1.1
+
+
+def test_engine_cpu_budget(engine):
+    x = src8(rng.standard_normal((BLOCK, 2)) * 0.1)
+    for _ in range(20):
+        engine._apply_upmix(x.copy(), out_ch=8)
+    t0 = time.perf_counter()
+    for _ in range(200):
+        engine._apply_upmix(x.copy(), out_ch=8)
+    per_block_ms = (time.perf_counter() - t0) / 200 * 1000
+    assert per_block_ms < 3.0, per_block_ms   # 10 ms budget per block

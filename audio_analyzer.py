@@ -14,6 +14,7 @@ import numpy as np
 import json
 from adaptive_control import ADAPTIVE_PARAMS, AdaptiveController
 from adaptive_renderer import AdaptiveFeatureEngine
+from spectral_upmix import SpectralUpmixer
 from xpdss_state import (
     apply_adaptive_state_to_object,
     apply_profile_to_object,
@@ -1056,7 +1057,7 @@ class AudioBypass:
         '_ht_cs_L', '_ht_delay_buf', '_shadow_lp_zi', '_dist_bass_zi', '_bound_lp_zi_L', '_abs_lp_zi_L',
         '_sub_period_est', '_sub_need_smooth', '_sub_last_avoid',
         '_vl_voice_mask', '_dlg_bp_sos', '_dlg_bp_zi', '_air_post_zi',
-        '_rs_out_pre',
+        '_rs_out_pre', '_spectral', '_delay_hist', '_spectral_was_active',
     )
 
     def _reset_dsp_state(self):
@@ -1802,7 +1803,7 @@ class AudioBypass:
         block *= gain_linear.astype(np.float32)
 
     # ─── #22 Surround Decorrelation (All-Pass Diffuser) ────────────────────
-    def _apply_surround_decorrelation(self, sig_L, sig_R):
+    def _apply_surround_decorrelation(self, sig_L, sig_R, bank='classic'):
         """Apply cascaded all-pass diffuser to side-channel content for surround routing.
 
         Makes surrounds sound genuinely ambient rather than 'delayed copy of fronts',
@@ -1827,22 +1828,21 @@ class AudioBypass:
             self._decorr_delays_R = [int(sr * d) for d in
                                      [0.00037, 0.00083, 0.00127, 0.00149, 0.00211, 0.00263]]
             self._decorr_coeffs_R = [0.57, 0.63, 0.50, 0.61, 0.56, 0.64]
-            # Per-channel state: each stage has a delay buffer
+            # Per-bank, per-channel state: each stage has a delay buffer
             self._decorr_ap_states = {}
+        if bank not in self._decorr_ap_states:
+            self._decorr_ap_states[bank] = {}
             for ch_tag, delays in [('L', self._decorr_delays), ('R', self._decorr_delays_R)]:
-                self._decorr_ap_states[ch_tag] = []
-                for d in delays:
-                    self._decorr_ap_states[ch_tag].append({
-                        'buf': np.zeros(d, dtype=np.float32),
-                        'ptr': 0
-                    })
+                self._decorr_ap_states[bank][ch_tag] = [
+                    {'buf': np.zeros(d, dtype=np.float32), 'ptr': 0} for d in delays]
+        states = self._decorr_ap_states[bank]
 
         def _process_channel(sig, ch_tag):
             out = sig.copy()
             delays = self._decorr_delays if ch_tag == 'L' else self._decorr_delays_R
             coeffs = self._decorr_coeffs if ch_tag == 'L' else self._decorr_coeffs_R
             for i, (delay, coeff) in enumerate(zip(delays, coeffs)):
-                state = self._decorr_ap_states[ch_tag][i]
+                state = states[ch_tag][i]
                 buf = state['buf']
                 ptr = state['ptr']
                 blen = len(buf)
@@ -3386,7 +3386,15 @@ class AudioBypass:
         # 1. Passthrough: real multichannel detected, stereo output, or upmix off
         force_passthrough = self.is_multichannel_detected and not self.manual_upmix
         is_passthrough = force_passthrough or out_ch <= 2 or not self.upmix_enabled
-        mode = 'pass' if is_passthrough else 'upmix'
+
+        # Spectral upmix engine (optional, A/B against the classic one). While
+        # it is selected, passthrough is delayed by the same latency so that
+        # switching between the two never jumps in time.
+        spectral = self._spectral_selected(out_ch)
+        if is_passthrough:
+            mode = 'pass_d' if spectral else 'pass'
+        else:
+            mode = 'spectral' if spectral else 'upmix'
 
         if is_passthrough and self.is_multichannel_detected:
             if self.last_mode != "PASSTHROUGH_DISCRETE":
@@ -3394,9 +3402,10 @@ class AudioBypass:
                 self.last_mode = "PASSTHROUGH_DISCRETE"
         elif is_passthrough:
             self.last_mode = "PASSTHROUGH_STEREO"
-        elif self.last_mode != "UPMIX":
-            print(f"\n[MODE] UPMIXING (Static Mode - {out_ch} ch)")
-            self.last_mode = "UPMIX"
+        elif self.last_mode != mode:
+            engine = "Spectral" if mode == 'spectral' else "Classic"
+            print(f"\n[MODE] UPMIXING ({engine} - {out_ch} ch)")
+            self.last_mode = mode
 
         # 2. Mode changes are crossfaded so switching never clicks
         fade_len = max(1, int(self.ROUTE_FADE_SECONDS * self.sample_rate))
@@ -3409,6 +3418,14 @@ class AudioBypass:
                 self._route_fade_pos = 0
             self._route_fade_from = prev_mode
         self._route_mode = mode
+
+        # The spectral engine runs once per block whenever the current route,
+        # or the one being faded out, needs it.
+        spectral_modes = ('spectral', 'pass_d')
+        if mode in spectral_modes or getattr(self, '_route_fade_from', None) in spectral_modes:
+            self._prepare_spectral_block(src_block)
+        else:
+            self._spectral_was_active = False
 
         self._route(mode, src_block, out_block, out_ch)
 
@@ -3459,8 +3476,98 @@ class AudioBypass:
     def _route(self, mode, src_block, out_block, out_ch):
         if mode == 'pass':
             self._route_passthrough(src_block, out_block, out_ch)
+        elif mode == 'pass_d':
+            self._route_passthrough(self._spec_delayed_src, out_block, out_ch, lfe_key='pass_d')
+        elif mode == 'spectral':
+            self._route_spectral(out_block, out_ch)
         else:
             self._route_upmix(src_block, out_block, out_ch)
+
+    # ─── Spectral upmix engine ──────────────────────────────────────────
+
+    def _spectral_selected(self, out_ch):
+        return bool(getattr(self, 'spectral_upmix', False) and self.upmix_enabled and out_ch > 2)
+
+    def _delay_block(self, key, block, delay):
+        """Fixed integer delay with per-key history (works for 1-D or 2-D blocks)."""
+        store = self.__dict__.setdefault('_delay_hist', {})
+        shape = (delay,) + block.shape[1:]
+        hist = store.get(key)
+        if hist is None or hist.shape != shape:
+            hist = np.zeros(shape, dtype=np.float32)
+        if delay <= 0:
+            return block
+        ext = np.concatenate((hist, block.astype(np.float32, copy=False)))
+        store[key] = ext[block.shape[0]:].copy()
+        return ext[:block.shape[0]]
+
+    def _prepare_spectral_block(self, src_block):
+        """Run the spectral analysis/resynthesis exactly once per block."""
+        engine = getattr(self, '_spectral', None)
+        if engine is None or engine.sample_rate != int(self.sample_rate):
+            engine = self._spectral = SpectralUpmixer(self.sample_rate)
+        if not getattr(self, '_spectral_was_active', False):
+            # (Re)activated: start from a clean state, never from stale audio
+            engine.reset()
+            self._delay_hist = {}
+            self._spectral_was_active = True
+        width = self.width_factor * getattr(self, '_dynamic_width_ratio', 1.0)
+        self._spec_streams = engine.process(
+            src_block[:, :2], center_spread=self.center_spread, width=width,
+            center=self.center_extraction).astype(np.float32)
+        self._spec_delayed_src = self._delay_block('spec_src', src_block, engine.latency)
+
+    def _route_spectral(self, out_block, out_ch):
+        """Front stage from the re-panned direct sound, ambience to the surrounds.
+
+        Windows channel order: FL FR C LFE BL BR SL SR (5.1: 4/5 = surrounds).
+        """
+        frames = out_block.shape[0]
+        streams = self._spec_streams
+        dl, dr, dc, al, ar = (streams[:, i] for i in range(5))
+        d_src = self._spec_delayed_src
+
+        # Ambience split front/rear by the radar's fade (constant power),
+        # surround level by Side Gain.
+        fade = (1.0 - (self.gui_panning_y + 1.0) / 2.0) * (math.pi / 2.0)
+        f_amb = self._get_ramp('_last_spec_famb', math.cos(fade), frames)
+        r_amb = self._get_ramp('_last_spec_ramb', math.sin(fade) * 10 ** (self.side_gain_db / 20.0), frames)
+
+        out_block[:, 0] = dl + f_amb * al
+        out_block[:, 1] = dr + f_amb * ar
+        if out_ch > 2:
+            out_block[:, 2] = dc * (0.707 if self.stage_equalizer else 1.0)
+
+        # LFE: identical to the classic upmix (low-passed L+R at -10 dB), on
+        # the delayed input so it stays aligned with the spectral output.
+        if out_ch > 3:
+            lfe = self._lfe_lowpass((d_src[:, 0] + d_src[:, 1]) * 0.316, key='spectral')
+            if getattr(self, 'dynamic_eq', False):
+                safe_level = max(getattr(self, 'dyn_eq_level', 0.0), float(np.max(np.abs(d_src))))
+                boost_factor = 1.0 + (1.0 - min(1.0, safe_level * 2.0)) * 0.58
+                lfe = lfe * self._get_ramp('_last_spec_dyn', boost_factor, frames)
+            out_block[:, 3] = 0.0 if self.lfe_muted else lfe
+
+        if out_ch <= 4:
+            return
+        # Surround ambience: 10 ms later than the fronts (precedence keeps the
+        # image in front), optionally diffused further.
+        haas = int(0.010 * self.sample_rate)
+        sa = self._delay_block('spec_haas', np.stack((al * r_amb, ar * r_amb), axis=1), haas)
+        sa_l, sa_r = sa[:, 0], sa[:, 1]
+        if getattr(self, 'surround_decorrelation', False):
+            sa_l, sa_r = self._apply_surround_decorrelation(sa_l, sa_r, bank='spectral')
+        if out_ch >= 8:
+            # 7.1: sides (6/7) carry most of it, backs (4/5) a later, diffused copy
+            back = self._delay_block('spec_back', np.stack((sa_l, sa_r), axis=1), int(0.008 * self.sample_rate))
+            back_l, back_r = self._apply_surround_decorrelation(back[:, 0], back[:, 1], bank='spectral_back')
+            out_block[:, 6] = 0.8 * sa_l
+            out_block[:, 7] = 0.8 * sa_r
+            out_block[:, 4] = 0.6 * back_l
+            out_block[:, 5] = 0.6 * back_r
+        else:
+            out_block[:, 4] = sa_l
+            out_block[:, 5] = sa_r
 
     def _downmix_extra_channels(self, src_block, out_block, out_ch):
         """Fold input channels the output layout lacks into the ones it has.
@@ -3486,7 +3593,7 @@ class AudioBypass:
                     target = 0 if is_left else 1
                 out_block[:, target] += 0.707 * sig
 
-    def _route_passthrough(self, src_block, out_block, out_ch):
+    def _route_passthrough(self, src_block, out_block, out_ch, lfe_key='pass'):
         """Discrete channels 1:1, extra channels downmixed, bass redirect to LFE."""
         frames, in_ch = src_block.shape
         limit = min(in_ch, out_ch)
@@ -3505,7 +3612,7 @@ class AudioBypass:
             else:
                 mains_sum = np.zeros(frames, dtype=np.float32)
             lfe_original = src_block[:, 3] if in_ch > 3 else 0.0
-            out_block[:, 3] = lfe_original + self._lfe_lowpass(mains_sum, key='pass')
+            out_block[:, 3] = lfe_original + self._lfe_lowpass(mains_sum, key=lfe_key)
 
         # Apply Safe Dynamic EQ if enabled and LFE exists (Stereo passthrough won't have out_ch > 3)
         if out_ch > 3 and getattr(self, 'dynamic_eq', False):
