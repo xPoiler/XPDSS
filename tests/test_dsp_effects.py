@@ -1,0 +1,465 @@
+"""One behavioural test per DSP effect, each run in isolation with a signal
+chosen to show whether the effect does its job."""
+import types
+
+import numpy as np
+import pytest
+
+import audio_analyzer as aa
+
+SR = 48000
+BLOCK = 480
+
+
+@pytest.fixture
+def engine(tmp_path):
+    app = aa.AudioBypass("CABLE Output", "AVR", simulation=True, config_file=str(tmp_path / "config.json"))
+    app.current_channels = 8
+    app.is_multichannel_detected = False
+    return app
+
+
+def tone(freq, seconds=1.0, amp=0.3, phase=0.0):
+    t = np.arange(int(SR * seconds)) / SR
+    return (amp * np.sin(2 * np.pi * freq * t + phase)).astype(np.float32)
+
+
+def level_db(sig, freq, bw=0.1):
+    """Level of the spectral peak around `freq` (dB, Hann-windowed)."""
+    sig = np.asarray(sig, dtype=np.float64)
+    spec = np.abs(np.fft.rfft(sig * np.hanning(len(sig)))) * 4.0 / len(sig)
+    freqs = np.fft.rfftfreq(len(sig), 1.0 / SR)
+    mask = (freqs >= freq * (1 - bw)) & (freqs <= freq * (1 + bw))
+    return 20 * np.log10(np.max(spec[mask]) + 1e-12)
+
+
+def rms_db(sig):
+    return 20 * np.log10(np.sqrt(np.mean(np.asarray(sig, dtype=np.float64) ** 2)) + 1e-12)
+
+
+def blockwise(fn, block, size=BLOCK):
+    """Run an in-place effect over `block` in chunks of `size` frames."""
+    out = block.copy()
+    for i in range(0, out.shape[0], size):
+        fn(out[i:i + size])
+    return out
+
+
+def stereo(sig_l, sig_r=None):
+    return np.stack([sig_l, sig_l if sig_r is None else sig_r], axis=1).copy()
+
+
+def upmix(engine, src, size=BLOCK):
+    """Run the full upmix over `src` (frames, 8) block by block."""
+    out = []
+    for i in range(0, src.shape[0], size):
+        out.append(engine._apply_upmix(src[i:i + size].copy(), out_ch=8).copy())
+    return np.concatenate(out)
+
+
+def src8(left, right):
+    s = np.zeros((len(left), 8), dtype=np.float32)
+    s[:, 0], s[:, 1] = left, right
+    return s
+
+
+# ── Block-size invariance for stateful (time-invariant) effects ─────────
+# A stateful filter must give the same output whatever the block size; a
+# per-block reset or discontinuity shows up as a difference here.
+
+INVARIANT_EFFECTS = {
+    "bass_exciter": lambda e, b: e._apply_harmonic_exciter(b),
+    "freq_dep_width": lambda e, b: e._apply_freq_dep_width(b),
+    "hp_externalization": lambda e, b: e._apply_hp_externalization(b),
+    "air_exciter": lambda e, b: e._apply_air_exciter(b),
+    "virtual_room": lambda e, b: e._apply_virtual_room(b),
+    "transaural": lambda e, b: e._apply_transaural_widener(b, b.shape[0]),
+}
+
+
+@pytest.mark.parametrize("name", sorted(INVARIANT_EFFECTS))
+def test_stateful_effects_are_block_size_invariant(tmp_path, name):
+    x = (np.random.default_rng(7).standard_normal((SR // 2, 2)) * 0.2).astype(np.float32)
+    outs = []
+    for size in (480, 441, 1024):
+        e = aa.AudioBypass("a", "b", simulation=True, config_file=str(tmp_path / f"{name}{size}.json"))
+        e.harmonic_exciter = e.air_exciter = e.virtual_room = True
+        outs.append(blockwise(lambda b: INVARIANT_EFFECTS[name](e, b), x, size))
+    np.testing.assert_allclose(outs[1], outs[0], atol=1e-5)
+    np.testing.assert_allclose(outs[2], outs[0], atol=1e-5)
+
+
+# ── Input restoration / dynamics ────────────────────────────────────────
+
+def test_declip_reconstructs_clipped_peaks(engine):
+    true = tone(200, 0.5, amp=1.3)
+    clipped = np.clip(true, -1.0, 1.0)
+    out = blockwise(engine._apply_declip, stereo(clipped))[:, 0]
+    mask = np.abs(clipped) >= 0.99
+    err_before = np.sqrt(np.mean((clipped[mask] - true[mask]) ** 2))
+    err_after = np.sqrt(np.mean((out[mask] - true[mask]) ** 2))
+    assert np.max(np.abs(out)) > 1.15          # peaks rebuilt above the clip level
+    assert err_after < 0.35 * err_before       # and much closer to the original
+    np.testing.assert_array_equal(out[~mask], clipped[~mask])  # clean samples untouched
+
+
+def test_declip_leaves_clean_audio_alone(engine):
+    x = stereo(tone(200, 0.2, amp=0.9))
+    np.testing.assert_array_equal(blockwise(engine._apply_declip, x), x)
+
+
+def test_loudness_norm_moves_quiet_and_loud_toward_target(engine):
+    quiet = stereo(tone(1000, 8.0, amp=0.0141))  # ~ -40 dBFS RMS
+    out = blockwise(engine._apply_loudness_norm, quiet)
+    assert rms_db(out[-SR:]) == pytest.approx(-40 + 12, abs=1.0)  # capped at +12 dB
+
+    engine._agc_gain_smooth = 1.0
+    loud = stereo(tone(1000, 4.0, amp=0.45))   # ~ -10 dBFS RMS
+    out = blockwise(engine._apply_loudness_norm, loud)
+    assert rms_db(out[-SR:]) == pytest.approx(-22.0, abs=1.0)  # -12 dB max cut
+
+
+def test_loudness_norm_ignores_silence(engine):
+    x = stereo(tone(1000, 2.0, amp=0.0005))    # below the -55 dB gate
+    np.testing.assert_array_equal(blockwise(engine._apply_loudness_norm, x), x)
+
+
+def test_micro_dynamics_lifts_quiet_passages_only(engine):
+    engine.micro_dyn_amount = 4.0
+    loud = tone(500, 6.0, amp=0.3)
+    quiet = tone(500, 1.5, amp=0.3 * 10 ** (-8 / 20))  # 8 dB below the running reference
+    out = blockwise(engine._apply_micro_dynamics, stereo(np.concatenate([loud, quiet])))[:, 0]
+    loud_gain = rms_db(out[4 * SR:6 * SR]) - rms_db(loud[4 * SR:])
+    quiet_gain = rms_db(out[-SR // 2:]) - rms_db(quiet[-SR // 2:])
+    assert abs(loud_gain) < 0.5
+    assert 2.5 < quiet_gain <= 4.05
+
+
+def test_transient_restore_boosts_onsets_not_sustain(engine):
+    engine.transient_amount = 6.0
+    x = np.zeros(SR, dtype=np.float32)
+    x[SR // 2:] = tone(800, 0.5, amp=0.3)       # silence, then a sudden onset
+    out = blockwise(engine._apply_transient_restore, stereo(x))[:, 0]
+    onset = slice(SR // 2, SR // 2 + 240)        # first 5 ms after the onset
+    sustain = slice(SR - 4800, SR)
+    assert np.max(np.abs(out[onset])) > 1.25 * np.max(np.abs(x[onset]))
+    assert abs(rms_db(out[sustain]) - rms_db(x[sustain])) < 0.5
+
+
+def test_clarity_cuts_mud_only_when_excessive(engine):
+    engine.clarity_dsp = True
+    engine.clarity_amount = 6.0
+    muddy = tone(350, 2.0, amp=0.3) + tone(3000, 2.0, amp=0.05)
+    out = blockwise(engine._apply_clarity_dsp, stereo(muddy))[:, 0]
+    tail = slice(SR, 2 * SR)
+    assert level_db(out[tail], 350) < level_db(muddy[tail], 350) - 1.5
+    assert abs(level_db(out[tail], 3000) - level_db(muddy[tail], 3000)) < 0.5
+
+    engine._clarity_gain_smooth = 0.0
+    bright = tone(3000, 1.0, amp=0.3)
+    out = blockwise(engine._apply_clarity_dsp, stereo(bright))[:, 0]
+    np.testing.assert_allclose(out, bright, atol=1e-6)
+
+
+# ── Tone / enhancement ──────────────────────────────────────────────────
+
+def test_dynamic_eq_is_flat_at_normal_level(engine):
+    engine._program_level_db = -15.0
+    x = stereo(tone(50, 1.0) + tone(1000, 1.0) + tone(12000, 1.0))
+    out = blockwise(lambda b: engine._apply_loudness_comp(b, engine._program_level_db), x)
+    np.testing.assert_allclose(out, x, atol=1e-6)
+
+
+def test_bass_exciter_adds_harmonics_of_low_bass(engine):
+    engine.harmonic_exciter = True
+    x = stereo(tone(50, 1.0, amp=0.4))
+    out = blockwise(engine._apply_harmonic_exciter, x)[:, 0]
+    tail = slice(SR // 2, SR)
+    assert level_db(out[tail], 100, 0.03) > level_db(x[tail, 0], 100, 0.03) + 30
+    assert level_db(out[tail], 50, 0.03) == pytest.approx(level_db(x[tail, 0], 50, 0.03), abs=1.0)
+    assert level_db(out[tail], 2000) < -70      # nothing leaks into the mids
+
+
+def test_air_exciter_only_touches_the_air_band(engine):
+    engine.air_exciter = True
+    engine.air_amount = 0.3
+    x = stereo(tone(1000, 1.0) + tone(14000, 1.0, amp=0.1))
+    out = blockwise(engine._apply_air_exciter, x)[:, 0]
+    tail = slice(SR // 2, SR)
+    assert abs(level_db(out[tail], 1000) - level_db(x[tail, 0], 1000)) < 0.2
+    assert level_db(out[tail], 14000) > level_db(x[tail, 0], 14000) + 0.8
+
+
+def test_freq_dep_width_monos_bass_and_widens_highs(engine):
+    lo = tone(60, 1.0)
+    hi = tone(10000, 1.0, amp=0.1)
+    mid = tone(1000, 1.0)
+    # anti-phase bass + anti-phase highs + in-phase mids
+    x = stereo(lo + hi + mid, -lo - hi + mid)
+    out = blockwise(engine._apply_freq_dep_width, x)
+    tail = slice(SR // 2, SR)
+    side = 0.5 * (out[tail, 0] - out[tail, 1])
+    side_in = 0.5 * (x[tail, 0] - x[tail, 1])
+    assert level_db(side, 60) < level_db(side_in, 60) - 15            # bass side removed
+    assert 1.0 < level_db(side, 10000) - level_db(side_in, 10000) < 3.0  # highs wider
+    assert level_db(out[tail, 0], 1000) == pytest.approx(level_db(x[tail, 0], 1000), abs=0.3)
+
+    engine._fdw_zi = {}  # drop the tail of the previous (anti-phase) signal
+    mono = stereo(lo + hi + mid)
+    np.testing.assert_allclose(blockwise(engine._apply_freq_dep_width, mono), mono, atol=1e-5)
+
+
+def test_spectral_tilt_keeps_all_channels_aligned(engine):
+    engine.spectral_tilt = True
+    sig = (np.random.default_rng(1).standard_normal(SR) * 0.1).astype(np.float32)
+    x = np.repeat(sig[:, None], 8, axis=1)
+    out = x.copy()
+    for i in range(0, SR, BLOCK):
+        engine._apply_spectral_tilt(out[i:i + BLOCK], BLOCK, 8)
+    for ch in range(1, 8):
+        np.testing.assert_allclose(out[:, ch], out[:, 0], atol=1e-6)
+    assert abs(rms_db(out[SR // 2:, 0]) - rms_db(sig[SR // 2:])) < 3.0
+
+
+# ── Spatial ─────────────────────────────────────────────────────────────
+
+def test_hp_externalization_crossfeeds_low_frequencies(engine):
+    x = stereo(tone(200, 1.0), np.zeros(SR, dtype=np.float32))  # left-only
+    out = blockwise(engine._apply_hp_externalization, x)
+    tail = slice(SR // 2, SR)
+    leak = level_db(out[tail, 1], 200) - level_db(out[tail, 0], 200)
+    assert -14 < leak < -6                      # some bass reaches the other ear
+
+
+def test_surround_decorrelation_is_allpass_and_decorrelates(engine):
+    imp = np.zeros(8192, dtype=np.float32)
+    imp[0] = 1.0
+    out_l, out_r = engine._apply_surround_decorrelation(imp, imp.copy())
+    mag = np.abs(np.fft.rfft(out_l))
+    assert np.max(np.abs(20 * np.log10(mag))) < 0.1  # flat magnitude response
+
+    engine2 = aa.AudioBypass("a", "b", simulation=True, config_file=engine.config_file + "2")
+    n = (np.random.default_rng(3).standard_normal(SR) * 0.2).astype(np.float32)
+    l, r = engine2._apply_surround_decorrelation(n, n.copy())
+    assert abs(np.corrcoef(l, r)[0, 1]) < 0.5        # identical input, decorrelated output
+    assert abs(rms_db(l) - rms_db(n)) < 0.5
+
+
+def test_virtual_room_adds_reflections_at_the_tap_times(engine):
+    engine.virtual_room = True
+    engine.virtual_room_mix = 1.0
+    x = np.zeros((4800, 2), dtype=np.float32)
+    x[0, 0] = 1.0                                   # impulse on the left
+    out = blockwise(engine._apply_virtual_room, x)
+    for ms, ch in ((4.3, 0), (7.1, 1), (11.4, 0), (17.8, 1)):
+        n = int(ms * SR / 1000)
+        assert np.max(np.abs(out[n:n + 40, ch])) > 0.01, (ms, ch)
+    assert np.max(np.abs(out[1:150, :])) < 0.01      # nothing before the first reflection
+
+
+def test_transaural_cancels_crosstalk_path(engine):
+    engine.transaural_delay = 7
+    engine.transaural_gain = 0.5
+    engine.transaural_feedback = 0.0
+    x = np.zeros((4800, 2), dtype=np.float32)
+    x[100, 0] = 1.0
+    out = blockwise(lambda b: engine._apply_transaural_widener(b, b.shape[0]), x)
+    # left impulse produces an inverted, delayed, low-passed copy on the right
+    right = out[:, 1]
+    assert np.argmin(right) >= 100 + 7
+    assert right.min() < -0.02
+    assert out[100, 0] == pytest.approx(1.0)
+
+
+# ── Upmix routing ───────────────────────────────────────────────────────
+
+def configure_upmix(engine, **flags):
+    engine.upmix_enabled = True
+    engine.center_extraction = True
+    for k, v in flags.items():
+        setattr(engine, k, v)
+
+
+def test_upmix_sends_mono_to_center_and_side_to_surrounds(engine):
+    configure_upmix(engine)
+    s = tone(1000, 0.5)
+    mono = upmix(engine, src8(s, s))
+    anti = upmix(engine, src8(s, -s))
+    tail = slice(SR // 4, SR // 2)
+    assert rms_db(mono[tail, 2]) > rms_db(mono[tail, 0]) + 20   # mono -> center
+    assert rms_db(mono[tail, 4]) < -60
+    assert rms_db(anti[tail, 2]) < -60                          # side -> no center
+    assert rms_db(anti[tail, 4]) > -20
+
+
+def test_center_extraction_off_folds_center_into_fronts(engine):
+    configure_upmix(engine, center_extraction=False)
+    s = tone(1000, 0.5)
+    out = upmix(engine, src8(s, s))
+    tail = slice(SR // 4, SR // 2)
+    assert rms_db(out[tail, 2]) < -60
+    assert rms_db(out[tail, 0]) == pytest.approx(rms_db(s[tail]) - 6.0, abs=0.5)
+
+
+def test_stage_equalizer_lowers_center_by_3db(engine):
+    configure_upmix(engine)
+    s = tone(1000, 0.5)
+    ref = upmix(engine, src8(s, s))
+    engine.stage_equalizer = True
+    out = upmix(engine, src8(s, s))
+    tail = slice(SR // 4, SR // 2)
+    assert rms_db(out[tail, 2]) - rms_db(ref[tail, 2]) == pytest.approx(-3.0, abs=0.1)
+
+
+def test_lfe_redirect_and_mute(engine):
+    configure_upmix(engine)
+    s = tone(60, 0.5) + tone(2000, 0.5)
+    out = upmix(engine, src8(s, s))
+    tail = slice(SR // 4, SR // 2)
+    assert level_db(out[tail, 3], 60) > -20
+    assert level_db(out[tail, 3], 2000) < level_db(out[tail, 3], 60) - 40
+    engine.lfe_muted = True
+    la = int(0.0015 * SR)  # limiter look-ahead still holds the previous run's tail
+    assert not upmix(engine, src8(s, s))[la:, 3].any()
+
+
+def test_widening_mode_feeds_delayed_mid_to_surrounds(engine):
+    configure_upmix(engine, center_spread=1.0, gui_panning_y=-1.0, widening_mode=True)
+    x = np.zeros(4800, dtype=np.float32)
+    x[960] = 0.5                                    # mono click
+    out = upmix(engine, src8(x, x))
+    la = int(0.0015 * SR)                           # limiter look-ahead
+    delay = int(engine.widening_delay_ms * SR / 1000)
+    assert np.argmax(np.abs(out[:, 4])) == 960 + delay + la
+
+
+def test_cinema_steering_routes_by_correlation(engine):
+    configure_upmix(engine, cinema_steering=True)
+    s = tone(1000, 2.0)
+    mono = upmix(engine, src8(s, s))
+    configure_upmix(engine := aa.AudioBypass("a", "b", simulation=True, config_file=engine.config_file + "x"), cinema_steering=True)
+    engine.current_channels = 8
+    anti = upmix(engine, src8(s, -s))
+    tail = slice(SR, 2 * SR)
+    assert rms_db(mono[tail, 4]) < -60                          # in-phase stays front
+    assert rms_db(anti[tail, 4]) > rms_db(anti[tail, 0]) + 10   # anti-phase goes back
+
+
+def test_gaming_panning_sends_anti_phase_to_rear(engine):
+    configure_upmix(engine, cinema_steering=True, gaming_panning=True)
+    s = tone(1000, 2.0)
+    anti = upmix(engine, src8(s, -s))
+    tail = slice(SR, 2 * SR)
+    assert rms_db(anti[tail, 4]) > -20
+    assert rms_db(anti[tail, 0]) < rms_db(anti[tail, 4]) - 10
+
+
+# ── Center-channel effects ──────────────────────────────────────────────
+
+def test_dialogue_focus_boosts_speech_band_with_a_ramp(engine):
+    x = np.zeros((SR, 3), dtype=np.float32)
+    x[:, 2] = tone(2500, 1.0) + tone(150, 1.0)
+    out = x.copy()
+    for i in range(0, SR, BLOCK):
+        engine._apply_dialogue_focus(out[i:i + BLOCK], True)
+    tail = slice(SR // 2, SR)
+    assert level_db(out[tail, 2], 2500) - level_db(x[tail, 2], 2500) == pytest.approx(3.5, abs=0.6)
+    assert abs(level_db(out[tail, 2], 150) - level_db(x[tail, 2], 150)) < 0.3
+    first = np.abs(out[:BLOCK, 2] - x[:BLOCK, 2])
+    assert first[:48].max() < 0.02                 # gain ramps in, no step
+
+    off = out[-BLOCK:].copy()
+    engine._apply_dialogue_focus(off, False)       # ramps back out
+    engine._apply_dialogue_focus(off, False)
+
+
+def test_vocal_lock_boosts_harmonic_center_more_than_noise(engine):
+    t = np.arange(SR) / SR
+    voice = sum(np.sin(2 * np.pi * 180 * k * t) / k for k in range(1, 12)).astype(np.float32) * 0.1
+    noise = (np.random.default_rng(5).standard_normal(SR) * 0.1).astype(np.float32)
+
+    def gain(sig):
+        e = aa.AudioBypass("a", "b", simulation=True, config_file=engine.config_file + str(id(sig)))
+        blk = np.zeros((SR, 3), dtype=np.float32)
+        blk[:, 2] = sig
+        out = blk.copy()
+        for i in range(0, SR, BLOCK):
+            e._apply_vocal_lock(out[i:i + BLOCK], BLOCK)
+        return rms_db(out[-SR // 4:, 2]) - rms_db(sig[-SR // 4:])
+
+    g_voice, g_noise = gain(voice), gain(noise)
+    assert 1.0 < g_voice <= 3.05
+    assert g_noise < g_voice - 1.0
+
+
+# ── Subharmonic synth ───────────────────────────────────────────────────
+
+def test_sub_synth_generates_half_frequency(engine):
+    engine.sub_synth = True
+    engine.sub_gain = 1.0
+    s = tone(60, 3.0, amp=0.3)
+    out = np.zeros((len(s), 8), dtype=np.float32)
+    out[:, 0] = out[:, 1] = s
+    for i in range(0, len(s), BLOCK):
+        engine._apply_subharmonic_synth(out[i:i + BLOCK], BLOCK, 8)
+    tail = slice(2 * SR, 3 * SR)
+    assert level_db(out[tail, 0], 30, 0.05) > level_db(s[tail], 30, 0.05) + 30
+    assert level_db(out[tail, 3], 30, 0.05) > -40   # also routed to the LFE
+
+
+def test_sub_synth_ducks_for_voice(engine):
+    engine.sub_synth = True
+    engine.sub_gain = 1.0
+    s = tone(60, 3.0, amp=0.1) + tone(200, 3.0, amp=0.4)   # voice-band energy dominates
+    out = np.zeros((len(s), 8), dtype=np.float32)
+    out[:, 0] = out[:, 1] = s
+    for i in range(0, len(s), BLOCK):
+        engine._apply_subharmonic_synth(out[i:i + BLOCK], BLOCK, 8)
+    assert np.max(np.abs(out[2 * SR:, 3])) < 1e-3
+
+
+# ── Head tracking ───────────────────────────────────────────────────────
+
+def tracked(engine, **pose):
+    engine.head_tracking = True
+    engine.head_tracker = types.SimpleNamespace(pos_x=0.0, pos_y=0.0, pos_z=1.0, rot_yaw=0.0)
+    for k, v in pose.items():
+        setattr(engine.head_tracker, k, v)
+
+
+def run_ht(engine, x, out_ch=8):
+    out = x.copy()
+    for i in range(0, x.shape[0], BLOCK):
+        engine._apply_head_tracking_panning(out[i:i + BLOCK], BLOCK, out_ch)
+    return out
+
+
+def test_head_tracking_centered_listener_is_neutral(engine):
+    tracked(engine)
+    x = np.repeat(tone(1000, 0.5)[:, None], 8, axis=1)
+    out = run_ht(engine, x)
+    tail = slice(SR // 4, SR // 2)
+    for ch in (0, 1, 2):
+        assert abs(rms_db(out[tail, ch]) - rms_db(x[tail, ch])) < 0.5
+
+
+def test_head_tracking_compensates_level_and_delay_when_off_center(engine):
+    tracked(engine, pos_x=-0.25)                    # listener moved toward the left speaker
+    x = np.repeat(tone(1000, 1.0)[:, None], 8, axis=1)
+    imp = np.zeros((SR, 8), dtype=np.float32)
+    imp[SR // 2, :] = 1.0
+    out = run_ht(engine, x)
+    tail = slice(SR // 2, SR)
+    assert rms_db(out[tail, 0]) < rms_db(out[tail, 1]) - 1.0   # nearer speaker attenuated
+    out_i = run_ht(engine, imp + 0)
+    assert np.argmax(np.abs(out_i[:, 0])) > np.argmax(np.abs(out_i[:, 1]))  # nearer speaker delayed
+
+
+def test_head_shadow_eq_rolls_off_highs_when_turned_away(engine):
+    tracked(engine, rot_yaw=0.9)
+    engine.head_shadow_eq = True
+    x = np.repeat((tone(200, 1.0) + tone(8000, 1.0, amp=0.1))[:, None], 3, axis=1)
+    out = run_ht(engine, x, out_ch=3)
+    tail = slice(SR // 2, SR)
+    assert level_db(out[tail, 0], 8000) < level_db(x[tail, 0], 8000) - 2.0
+    assert abs(level_db(out[tail, 0], 200) - level_db(x[tail, 0], 200)) < 1.0

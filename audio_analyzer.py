@@ -1865,9 +1865,13 @@ class AudioBypass:
             # All-pass coefficient per stage: controls diffusion density
             # Higher = more diffuse but more latent; 0.5-0.7 is the sweet spot
             self._decorr_coeffs = [0.60, 0.55, 0.62, 0.58, 0.65, 0.52]
-            # Different delay/coeff orderings per channel maximize decorrelation
-            self._decorr_delays_R = list(reversed(self._decorr_delays))
-            self._decorr_coeffs_R = [0.52, 0.65, 0.58, 0.62, 0.55, 0.60]
+            # The right channel needs a DIFFERENT set of stages: cascaded
+            # all-pass filters commute, so merely reversing the order of the
+            # same (delay, coeff) pairs produced an identical filter and no
+            # decorrelation at all.
+            self._decorr_delays_R = [int(sr * d) for d in
+                                     [0.00037, 0.00083, 0.00127, 0.00149, 0.00211, 0.00263]]
+            self._decorr_coeffs_R = [0.57, 0.63, 0.50, 0.61, 0.56, 0.64]
             # Per-channel state: each stage has a delay buffer
             self._decorr_ap_states = {}
             for ch_tag, delays in [('L', self._decorr_delays), ('R', self._decorr_delays_R)]:
@@ -1929,43 +1933,34 @@ class AudioBypass:
 
     # ─── #20 Frequency-Dependent Stereo Width ─────────────────────────────
     def _apply_freq_dep_width(self, block):
-        """Mono bass (<200 Hz), untouched mids, widened highs (>8 kHz)."""
+        """Mono bass (<200 Hz), untouched mids, widened highs (>8 kHz).
+
+        Works on Mid/Side: the side signal is high-passed at 200 Hz (so bass
+        becomes mono: about -21 dB of side at 60 Hz) and 40 % of its >8 kHz
+        content is added back on top. Mono content passes bit-exact.
+        """
         if block.shape[1] < 2:
             return
         sr = self.sample_rate
 
         if not hasattr(self, '_fdw_lo_sos'):
-            self._fdw_lo_sos = butter(2, 200.0 / (sr / 2), btype='low', output='sos')
-            self._fdw_hi_sos = butter(2, 8000.0 / (sr / 2), btype='high', output='sos')
+            self._fdw_lo_sos = butter(2, 200.0 / (sr / 2), btype='high', output='sos')
+            self._fdw_hi_sos = butter(2, min(0.95, 8000.0 / (sr / 2)), btype='high', output='sos')
             self._fdw_zi = {}
 
-        L = block[:, 0].copy()
-        R = block[:, 1].copy()
+        L = block[:, 0].astype(np.float64)
+        R = block[:, 1].astype(np.float64)
+        mid = 0.5 * (L + R)
+        side = 0.5 * (L - R)
 
-        for tag, sos, sig in [('lo_L', self._fdw_lo_sos, L), ('lo_R', self._fdw_lo_sos, R),
-                               ('hi_L', self._fdw_hi_sos, L), ('hi_R', self._fdw_hi_sos, R)]:
-            if tag not in self._fdw_zi:
-                self._fdw_zi[tag] = sosfilt_zi(sos) * 0.0
-            filtered, self._fdw_zi[tag] = sosfilt(sos, sig, zi=self._fdw_zi[tag])
-            if tag == 'lo_L': lo_L = filtered
-            elif tag == 'lo_R': lo_R = filtered
-            elif tag == 'hi_L': hi_L = filtered
-            elif tag == 'hi_R': hi_R = filtered
+        zi = self._ensure_sos_zi(self._fdw_zi, 'side_lo', self._fdw_lo_sos)
+        side_no_bass, self._fdw_zi['side_lo'] = sosfilt(self._fdw_lo_sos, side, zi=zi)
+        zi = self._ensure_sos_zi(self._fdw_zi, 'side_hi', self._fdw_hi_sos)
+        side_air, self._fdw_zi['side_hi'] = sosfilt(self._fdw_hi_sos, side, zi=zi)
+        side_out = side_no_bass + 0.4 * side_air
 
-        mid_L = L - lo_L - hi_L
-        mid_R = R - lo_R - hi_R
-
-        # Bass: collapse to mono
-        lo_mono = (lo_L + lo_R) * 0.5
-
-        # Highs: enhance stereo width by 40 %
-        hi_mid = (hi_L + hi_R) * 0.5
-        hi_side = (hi_L - hi_R) * 0.5 * 1.4
-        hi_L_w = hi_mid + hi_side
-        hi_R_w = hi_mid - hi_side
-
-        block[:, 0] = lo_mono + mid_L + hi_L_w
-        block[:, 1] = lo_mono + mid_R + hi_R_w
+        block[:, 0] = mid + side_out
+        block[:, 1] = mid - side_out
 
     # ─── #21 Headphone Externalization ────────────────────────────────────
     def _apply_hp_externalization(self, block):
@@ -2162,17 +2157,18 @@ class AudioBypass:
             zi = self._ensure_sos_zi(self._air_hp_zi, ch, self._air_hp_sos)
             excited[:, ch], self._air_hp_zi[ch] = sosfilt(self._air_hp_sos, block[:, ch], zi=zi)
             
-        # 2. Smooth, monotonic soft saturation (tanh): ~linear for small
-        #    signals, adds odd harmonics as level rises, no discontinuity.
-        excited = 0.5 * np.tanh(2.0 * excited)
+        # 2. Harmonics: smooth, bounded odd-order term (no discontinuity)
+        harmonics = 0.25 * np.tanh(2.0 * excited) ** 3
 
-        # 2b. High-pass again: harmonics folded back below ~10 kHz by aliasing
-        #     are removed, only the "air" band is added to the signal.
+        # 2b. High-pass the harmonics again so products aliased back below
+        #     ~10 kHz are removed; the linear air band keeps a single HP so its
+        #     phase still adds constructively to the dry signal.
         if not hasattr(self, '_air_post_zi'):
             self._air_post_zi = {}
         for ch in range(n_ch):
             zi = self._ensure_sos_zi(self._air_post_zi, ch, self._air_hp_sos)
-            excited[:, ch], self._air_post_zi[ch] = sosfilt(self._air_hp_sos, excited[:, ch], zi=zi)
+            harmonics[:, ch], self._air_post_zi[ch] = sosfilt(self._air_hp_sos, harmonics[:, ch], zi=zi)
+        excited += harmonics
 
         # 3. Mix
         amount = self._adaptive_value('air_amount', getattr(self, 'air_amount', 0.3))
