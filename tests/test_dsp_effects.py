@@ -463,3 +463,101 @@ def test_head_shadow_eq_rolls_off_highs_when_turned_away(engine):
     tail = slice(SR // 2, SR)
     assert level_db(out[tail, 0], 8000) < level_db(x[tail, 0], 8000) - 2.0
     assert abs(level_db(out[tail, 0], 200) - level_db(x[tail, 0], 200)) < 1.0
+
+
+# ── Surround passthrough ────────────────────────────────────────────────
+
+def surround_block(seed, center=0.0, surr=0.0, lfe=0.0, extras_noise=0.0, matrix=False, frames=BLOCK):
+    rng = np.random.default_rng(seed)
+    x = np.zeros((frames, 8), dtype=np.float32)
+    L, R = rng.standard_normal(frames) * 0.1, rng.standard_normal(frames) * 0.1
+    x[:, 0], x[:, 1] = L, R
+    x[:, 2] = rng.standard_normal(frames) * center
+    x[:, 3] = rng.standard_normal(frames) * lfe
+    for ch in (4, 5, 6, 7):
+        x[:, ch] = rng.standard_normal(frames) * surr
+    if matrix:
+        x[:, 2] = 0.5 * (L + R) + rng.standard_normal(frames) * 0.012
+        for ch in (4, 6):
+            x[:, ch] = 0.5 * (L - R) + rng.standard_normal(frames) * 0.012
+        for ch in (5, 7):
+            x[:, ch] = -0.5 * (L - R) + rng.standard_normal(frames) * 0.012
+    if extras_noise:
+        for ch in (2, 4, 5, 6, 7):
+            x[:, ch] += rng.standard_normal(frames) * extras_noise
+    return x
+
+
+@pytest.mark.parametrize("kwargs", [
+    dict(center=0.1, surr=0.016),          # movie: dialog + ambience
+    dict(surr=0.005),                      # surround ambience 26 dB below the fronts
+    dict(surr=0.00056),                    # 45 dB below the fronts
+    dict(center=0.1),                      # dialog only
+])
+def test_discrete_surround_is_detected(kwargs):
+    hits = [aa.AudioBypass._block_has_discrete_surround(surround_block(s, **kwargs)) for s in range(20)]
+    assert all(hits)
+
+
+@pytest.mark.parametrize("kwargs", [
+    dict(),                                # stereo on a multichannel cable
+    dict(extras_noise=10 ** (-130 / 20)),  # 24-bit dither
+    dict(extras_noise=10 ** (-80 / 20)),   # noise floor
+    dict(lfe=0.1),                         # LFE only
+    dict(matrix=True),                     # third-party matrix upmix of stereo
+])
+def test_stereo_content_never_triggers_passthrough(kwargs):
+    hits = [aa.AudioBypass._block_has_discrete_surround(surround_block(s, **kwargs)) for s in range(20)]
+    assert not any(hits)
+
+
+@pytest.mark.parametrize("out_ch, expected", [
+    (8, {0: {0: 0.0}, 2: {2: 0.0}, 4: {4: 0.0}, 6: {6: 0.0}}),
+    (6, {0: {0: 0.0}, 2: {2: 0.0}, 4: {4: 0.0, 6: -3.0}, 5: {5: 0.0, 7: -3.0}}),
+    (2, {0: {0: 0.0, 2: -3.0, 3: -10.0, 4: -3.0, 6: -3.0}, 1: {1: 0.0, 2: -3.0, 3: -10.0, 5: -3.0, 7: -3.0}}),
+])
+def test_passthrough_downmixes_channels_the_output_lacks(engine, out_ch, expected):
+    freqs = [500, 700, 1100, 40, 1300, 1700, 1900, 2300]
+    src = np.zeros((SR, 8), dtype=np.float32)
+    for ch, f in enumerate(freqs):
+        src[:, ch] = tone(f, 1.0, amp=0.2)
+    engine.is_multichannel_detected = True
+    engine.current_channels = out_ch
+    out = np.concatenate([engine._apply_upmix(src[i:i + BLOCK].copy(), out_ch=out_ch).copy()
+                          for i in range(0, SR, BLOCK)])
+    tail = slice(SR // 2, SR)
+    for o, sources in expected.items():
+        for c, gain_db in sources.items():
+            got = level_db(out[tail, o], freqs[c], 0.03) - level_db(src[tail, c], freqs[c], 0.03)
+            assert got == pytest.approx(gain_db, abs=0.3), (o, c)
+
+
+def test_mode_switch_is_crossfaded(engine):
+    configure_upmix(engine)
+    src = np.zeros((SR, 8), dtype=np.float32)
+    src[:, 0], src[:, 1] = tone(300, 1.0), tone(300, 1.0, phase=1.0)
+    src[:, 2] = tone(800, 1.0)
+    src[:, 4] = src[:, 5] = tone(1200, 1.0, amp=0.2)
+    outs = []
+    for i in range(0, SR, BLOCK):
+        engine.is_multichannel_detected = i >= SR // 2
+        outs.append(engine._apply_upmix(src[i:i + BLOCK].copy(), out_ch=8).copy())
+    out = np.concatenate(outs)
+    b = SR // 2 + int(0.0015 * SR)
+    for ch in (0, 2, 4):
+        normal = max(np.abs(np.diff(out[b - 2400:b - 2, ch])).max(),
+                     np.abs(np.diff(out[b + 2600:b + 7000, ch])).max())
+        assert np.abs(np.diff(out[b - 2:b + 2400, ch])).max() <= normal * 1.05
+
+
+def test_headphone_tracking_counter_rotation_applies_on_stereo_output(engine):
+    engine.headphone_tracking = True
+    engine._dynamic_pan_offset = 0.5
+    engine.head_tracker = types.SimpleNamespace(pos_x=0.0, pos_y=0.0, pos_z=1.0, rot_yaw=-0.785)
+    s = tone(1000, 0.5)
+    src = np.zeros((len(s), 8), dtype=np.float32)
+    src[:, 0] = src[:, 1] = s
+    out = np.concatenate([engine._apply_upmix(src[i:i + BLOCK].copy(), out_ch=2).copy()
+                          for i in range(0, len(s), BLOCK)])
+    tail = slice(SR // 4, SR // 2)
+    assert rms_db(out[tail, 0]) < rms_db(out[tail, 1]) - 3.0

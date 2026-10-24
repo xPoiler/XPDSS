@@ -31,7 +31,7 @@ except Exception:  # PortAudio missing (e.g. headless test runs)
 IS_WINDOWS = sys.platform == 'win32'
 
 # Constants for detection
-RMS_THRESHOLD = 0.005
+SURROUND_SILENCE_FLOOR = 10 ** (-70 / 20)  # center/surround RMS above this = real content
 STABILITY_WINDOW = 3.0
 CHECK_INTERVAL = 0.2
 BLOCK_SIZE = 0           # 0 allows WASAPI to choose the most stable hardware buffer
@@ -527,62 +527,24 @@ class AudioBypass:
                 if chs < 2:
                     continue
 
-                # 1. Check for signal activity in surround channels (2+)
                 peak = np.max(np.abs(data), axis=0)
-                active = peak > RMS_THRESHOLD
-                
-                has_surround_signal = False
                 if chs <= 2:
                     # Stereo sources still feed GUI metering, width tracking, and
                     # adaptive analysis below; they simply are not discrete surround.
                     self.is_multichannel_detected = False
-                elif np.any(active[2:]):
-                    # 2. Distinguish: Is it Real Surround or just our Upmix?
-                    # We EXCLUDE LFE (index 3) from discrete detection
-                    L = data[:, 0]
-                    R = data[:, 1]
-                    main_peak = max(peak[0], peak[1], 1e-6)
-                    L_plus_R = L + R
-                    L_minus_R = L - R
+                is_discrete = self._block_has_discrete_surround(data)
 
-                    is_discrete = False
-                    
-                    # Check Center Channel (Index 2)
-                    # Must be active AND have significant energy relative to L/R
-                    if active[2] and (peak[2] / main_peak > 0.1):
-                        # Sanity Check: if fronts are silent or softer, center is discrete (upmix can't create it from silence)
-                        if peak[2] > max(peak[0], peak[1]) * 0.8:
-                            is_discrete = True
-                        else:
-                            C = data[:, 2]
-                            corr_center = np.abs(np.corrcoef(C, L_plus_R)[0, 1]) if np.any(L_plus_R) else 0
-                            # corr_center > 0.99 catches pure mirrors from isolated test files on quiet channels
-                            if np.isnan(corr_center) or corr_center < 0.95 or corr_center > 0.999:
-                                is_discrete = True
-                    
-                    # Check Surrounds (Index 4, 5) - Ignore LFE at index 3
-                    indices_to_check = [i for i in [4, 5] if i < chs]
-                    for idx in indices_to_check:
-                        if not is_discrete and active[idx] and (peak[idx] / main_peak > 0.1):
-                            # Sanity Check: if fronts are silent or softer, surround is discrete (upmix can't create it from silence)
-                            if peak[idx] > max(peak[0], peak[1]) * 0.8:
-                                is_discrete = True
-                                break
-                            else:
-                                S = data[:, idx]
-                                corr_surround = np.abs(np.corrcoef(S, L_minus_R)[0, 1]) if np.any(L_minus_R) else 0
-                                # corr_surround > 0.99 catches pure mirrors from isolated test files on quiet channels
-                                if np.isnan(corr_surround) or corr_surround < 0.95 or corr_surround > 0.999:
-                                    is_discrete = True
-                                    break
-                    
-                    if is_discrete:
-                        has_surround_signal = True
+                # Require two consecutive discrete analysis blocks before switching
+                # in (a single stray block never triggers); staying in is refreshed
+                # by every discrete block and released after STABILITY_WINDOW.
+                if is_discrete:
+                    self._discrete_hits = getattr(self, '_discrete_hits', 0) + 1
+                    if self._discrete_hits >= 2 or self.is_multichannel_detected:
+                        self.last_active_time = time.time()
+                        self.is_multichannel_detected = True
+                else:
+                    self._discrete_hits = 0
 
-                if has_surround_signal:
-                    self.last_active_time = time.time()
-                    self.is_multichannel_detected = True
-                
                 # Update last_peaks for GUI metering (with smoothing for premium feel)
                 # Leaky integrator: smooth_peak = 0.7 * smooth_peak + 0.3 * current_peak
                 peak_arr = np.array(peak)
@@ -634,6 +596,41 @@ class AudioBypass:
                 continue
             except Exception as e:
                 print(f"Analysis error: {e}")
+
+    @staticmethod
+    def _block_has_discrete_surround(data):
+        """True when a (frames, channels) input block carries real discrete
+        center/surround content.
+
+        A stereo source on a multichannel cable leaves the center/surround
+        channels digitally silent, so any real signal (RMS > -70 dBFS, above
+        dither and noise floors) counts, however quiet relative to the fronts.
+        Channels that are just an L+R / L-R derivative (a third-party matrix
+        upmix, correlation 0.95-0.999) do not count. The LFE is ignored.
+        """
+        chs = data.shape[1]
+        if chs <= 2:
+            return False
+        rms = np.sqrt(np.mean(np.square(data, dtype=np.float64), axis=0))
+        live = [i for i in (2, 4, 5, 6, 7) if i < chs and rms[i] > SURROUND_SILENCE_FLOOR]
+        if not live:
+            return False
+        L = data[:, 0]
+        R = data[:, 1]
+        fronts_silent = max(rms[0], rms[1]) < SURROUND_SILENCE_FLOOR
+        for idx in live:
+            # Signal with silent fronts: no upmix can create that
+            if fronts_silent:
+                return True
+            ref = (L + R) if idx == 2 else (L - R)
+            if not np.any(ref):
+                return True
+            corr = np.abs(np.corrcoef(data[:, idx], ref)[0, 1])
+            # 0.95-0.999: a derived (matrixed) channel. > 0.999 is an exact
+            # mirror, which a discrete test file can contain.
+            if np.isnan(corr) or corr < 0.95 or corr > 0.999:
+                return True
+        return False
 
     def get_active_channels(self, data):
         # This is no longer used in the callback; moved to worker
@@ -3400,10 +3397,13 @@ class AudioBypass:
         setattr(self, key, current_val)
         return buf
 
+    ROUTE_FADE_SECONDS = 0.05
+
     def _apply_upmix(self, src_block, out_ch=None):
         """
-        Static Mid/Side distribution.
-        src_block: (frames, max_input_ch)
+        Route the input to the output layout (passthrough or upmix), then run
+        the post-effects pipeline and the output limiter.
+        src_block: (frames, input channels)
         returns out_block: (frames, out_ch)
         """
         frames = src_block.shape[0]
@@ -3411,89 +3411,154 @@ class AudioBypass:
             out_ch = self.current_channels
 
         # Reuse pre-allocated output buffer when possible (avoids malloc in RT)
-        buf_key = '_upmix_out_buf'
-        _buf = getattr(self, buf_key, None)
+        _buf = getattr(self, '_upmix_out_buf', None)
         if _buf is None or _buf.shape[0] < frames or _buf.shape[1] != out_ch:
-            _buf = np.zeros((frames, out_ch), dtype=np.float32)
-            setattr(self, buf_key, _buf)
+            _buf = np.zeros((max(frames, 8192), out_ch), dtype=np.float32)
+            self._upmix_out_buf = _buf
         out_block = _buf[:frames]
         out_block[:] = 0.0
 
-        in_ch = src_block.shape[1]
-
-        # 0. Master Bypass Mode
+        # 0. Master Bypass Mode: no DSP, but channels the output lacks are
+        #    still downmixed rather than dropped.
         if getattr(self, 'bypass_all', False):
-            limit = min(in_ch, out_ch)
+            limit = min(src_block.shape[1], out_ch)
             out_block[:, :limit] = src_block[:, :limit]
+            self._downmix_extra_channels(src_block, out_block, out_ch)
             return out_block
 
-        # 1. Passthrough Case: Real multichannel detected OR fall-back to Stereo
-        # (Override if manual_upmix is false and we detect discrete)
+        # 1. Passthrough: real multichannel detected, stereo output, or upmix off
         force_passthrough = self.is_multichannel_detected and not self.manual_upmix
-        
         is_passthrough = force_passthrough or out_ch <= 2 or not self.upmix_enabled
-        
-        if is_passthrough:
-            if self.is_multichannel_detected:
-                if self.last_mode != "PASSTHROUGH_DISCRETE":
-                    print("\n[MODE] PASSTHROUGH (Full Discrete Surround)")
-                    self.last_mode = "PASSTHROUGH_DISCRETE"
-            else:
-                if self.last_mode != "PASSTHROUGH_STEREO":
-                    self.last_mode = "PASSTHROUGH_STEREO"
-            
-            limit = min(in_ch, out_ch)
-            out_block[:, :limit] = src_block[:, :limit]
+        mode = 'pass' if is_passthrough else 'upmix'
 
-            # Double Bass: low-passed mains redirected to the LFE at -10 dB.
-            # Normalised by the number of active mains so a loud discrete
-            # 7.1 mix does not sum to several times full scale.
-            if out_ch > 3:
-                other_channels = [i for i in range(in_ch) if i != 3]
-                if other_channels:
-                    mains = src_block[:, other_channels]
-                    active = int(np.count_nonzero(np.max(np.abs(mains), axis=0) > 1e-4))
-                    mains_sum = np.sum(mains, axis=1) * (0.316 * 2.0 / max(2, active))
-                else:
-                    mains_sum = np.zeros(frames, dtype=np.float32)
-                lfe_original = src_block[:, 3] if in_ch > 3 else 0.0
-                out_block[:, 3] = lfe_original + self._lfe_lowpass(mains_sum)
-
-            # Apply Safe Dynamic EQ if enabled and LFE exists (Stereo passthrough won't have out_ch > 3)
-            if out_ch > 3 and getattr(self, 'dynamic_eq', False):
-                safe_level = max(getattr(self, 'dyn_eq_level', 0.0), np.max(np.abs(src_block)))
-                boost_factor = 1.0 + (1.0 - min(1.0, safe_level * 2.0)) * 0.58
-                ramp = self._get_ramp('_last_pass_dyn', boost_factor, frames)
-                out_block[:, 3] *= ramp
-
-            # ─── Post-Routing Global Effects ───
-            
-            # Apply Global Radar Panning to Out Block Left & Right Sides (Decoupled from Upmix logic)
-            if getattr(self, 'independent_panning', False):
-                panning_x = self.gui_panning_x
-                bal_l = 1.0 - max(0, panning_x)
-                bal_r = 1.0 - max(0, -panning_x)
-                
-                # Apply to all lefts and all rights based on channel format
-                out_block[:, 0] *= bal_l
-                out_block[:, 1] *= bal_r
-                if out_ch > 4:
-                    out_block[:, 4] *= bal_l
-                    out_block[:, 5] *= bal_r
-                if out_ch > 6:
-                    out_block[:, 6] *= bal_l
-                    out_block[:, 7] *= bal_r
-
-            # ─── Post-Upmix Effects Pipeline ───
-            self._apply_post_effects(out_block, out_block.shape[1], skip_subsynth=force_passthrough, src_block=src_block, is_passthrough=True)
-            out_block[:, :] = self._apply_true_peak_limiter(out_block)
-
-            return out_block
-
-        if self.last_mode != "UPMIX":
-            print(f"\n[MODE] UPMIXING (Static Mode - {self.current_channels} ch)")
+        if is_passthrough and self.is_multichannel_detected:
+            if self.last_mode != "PASSTHROUGH_DISCRETE":
+                print("\n[MODE] PASSTHROUGH (Full Discrete Surround)")
+                self.last_mode = "PASSTHROUGH_DISCRETE"
+        elif is_passthrough:
+            self.last_mode = "PASSTHROUGH_STEREO"
+        elif self.last_mode != "UPMIX":
+            print(f"\n[MODE] UPMIXING (Static Mode - {out_ch} ch)")
             self.last_mode = "UPMIX"
 
+        # 2. Mode changes are crossfaded so switching never clicks
+        fade_len = max(1, int(self.ROUTE_FADE_SECONDS * self.sample_rate))
+        prev_mode = getattr(self, '_route_mode', None) or mode
+        if mode != prev_mode:
+            if getattr(self, '_route_fade_from', None) == mode:
+                # Flipped back mid-fade: reverse the fade from where it is
+                self._route_fade_pos = fade_len - self._route_fade_pos
+            else:
+                self._route_fade_pos = 0
+            self._route_fade_from = prev_mode
+        self._route_mode = mode
+
+        self._route(mode, src_block, out_block, out_ch)
+
+        if getattr(self, '_route_fade_from', None) is not None:
+            fb = getattr(self, '_route_fade_buf', None)
+            if fb is None or fb.shape[0] < frames or fb.shape[1] != out_ch:
+                fb = self._route_fade_buf = np.zeros((max(frames, 8192), out_ch), dtype=np.float32)
+            other = fb[:frames]
+            other[:] = 0.0
+            self._route(self._route_fade_from, src_block, other, out_ch)
+            w = np.clip((self._route_fade_pos + np.arange(1, frames + 1)) / fade_len, 0.0, 1.0).astype(np.float32)
+            out_block *= w[:, np.newaxis]
+            out_block += other * (1.0 - w)[:, np.newaxis]
+            self._route_fade_pos += frames
+            if self._route_fade_pos >= fade_len:
+                self._route_fade_from = None
+
+        # ─── Post-Routing Global Effects ───
+        # Radar balance, or headphone-tracking counter-rotation (applies in
+        # both modes: stereo outputs always take the passthrough route)
+        is_hp_tracking = getattr(self, 'headphone_tracking', False)
+        if getattr(self, 'independent_panning', False) or is_hp_tracking:
+            panning_x = self.gui_panning_x if getattr(self, 'independent_panning', False) else 0.0
+            if is_hp_tracking:
+                panning_x += getattr(self, '_dynamic_pan_offset', 0.0)
+            panning_x = max(-1.0, min(1.0, panning_x))
+
+            bal_l = self._get_ramp('_last_bal_l', 1.0 - max(0.0, panning_x), frames)
+            bal_r = self._get_ramp('_last_bal_r', 1.0 - max(0.0, -panning_x), frames)
+
+            # Apply to all lefts and all rights based on channel format
+            out_block[:, 0] *= bal_l
+            out_block[:, 1] *= bal_r
+            if out_ch > 5:
+                out_block[:, 4] *= bal_l
+                out_block[:, 5] *= bal_r
+            if out_ch > 7:
+                out_block[:, 6] *= bal_l
+                out_block[:, 7] *= bal_r
+
+        # ─── Post-Upmix Effects Pipeline ───
+        self._apply_post_effects(out_block, out_ch, skip_subsynth=force_passthrough,
+                                 src_block=src_block, is_passthrough=is_passthrough)
+
+        # Output peak limiter (all channels)
+        return self._apply_true_peak_limiter(out_block)
+
+    def _route(self, mode, src_block, out_block, out_ch):
+        if mode == 'pass':
+            self._route_passthrough(src_block, out_block, out_ch)
+        else:
+            self._route_upmix(src_block, out_block, out_ch)
+
+    def _downmix_extra_channels(self, src_block, out_block, out_ch):
+        """Fold input channels the output layout lacks into the ones it has.
+
+        Windows channel order: FL FR C LFE BL BR SL SR. Center and surrounds
+        go in at -3 dB (ITU-style), the LFE at -10 dB into L/R on outputs
+        without an LFE channel; on 5.1 outputs the 7.1 sides fold into 4/5.
+        """
+        in_ch = src_block.shape[1]
+        for ch in range(out_ch, in_ch):
+            sig = src_block[:, ch]
+            if ch == 2:
+                out_block[:, 0] += 0.707 * sig
+                out_block[:, 1] += 0.707 * sig
+            elif ch == 3:
+                out_block[:, 0] += 0.316 * sig
+                out_block[:, 1] += 0.316 * sig
+            else:
+                is_left = ch % 2 == 0
+                if out_ch >= 6:
+                    target = 4 if is_left else 5
+                else:
+                    target = 0 if is_left else 1
+                out_block[:, target] += 0.707 * sig
+
+    def _route_passthrough(self, src_block, out_block, out_ch):
+        """Discrete channels 1:1, extra channels downmixed, bass redirect to LFE."""
+        frames, in_ch = src_block.shape
+        limit = min(in_ch, out_ch)
+        out_block[:, :limit] = src_block[:, :limit]
+        self._downmix_extra_channels(src_block, out_block, out_ch)
+
+        # Double Bass: low-passed mains redirected to the LFE at -10 dB.
+        # Normalised by the number of active mains so a loud discrete
+        # 7.1 mix does not sum to several times full scale.
+        if out_ch > 3:
+            other_channels = [i for i in range(in_ch) if i != 3]
+            if other_channels:
+                mains = src_block[:, other_channels]
+                active = int(np.count_nonzero(np.max(np.abs(mains), axis=0) > 1e-4))
+                mains_sum = np.sum(mains, axis=1) * (0.316 * 2.0 / max(2, active))
+            else:
+                mains_sum = np.zeros(frames, dtype=np.float32)
+            lfe_original = src_block[:, 3] if in_ch > 3 else 0.0
+            out_block[:, 3] = lfe_original + self._lfe_lowpass(mains_sum, key='pass')
+
+        # Apply Safe Dynamic EQ if enabled and LFE exists (Stereo passthrough won't have out_ch > 3)
+        if out_ch > 3 and getattr(self, 'dynamic_eq', False):
+            safe_level = max(getattr(self, 'dyn_eq_level', 0.0), np.max(np.abs(src_block)))
+            boost_factor = 1.0 + (1.0 - min(1.0, safe_level * 2.0)) * 0.58
+            ramp = self._get_ramp('_last_pass_dyn', boost_factor, frames)
+            out_block[:, 3] *= ramp
+
+    def _route_upmix(self, src_block, out_block, out_ch):
+        """Static / cinema / gaming Mid-Side upmix of the front pair."""
         # 2. Advanced Upmix Steering
         L = src_block[:, 0]
         R = src_block[:, 1]
@@ -3684,7 +3749,7 @@ class AudioBypass:
                 BL, BR = self._apply_surround_decorrelation(BL, BR)
 
         # Consistent Sub Level: low-passed L+R redirected at -10dB (0.316)
-        LFE = self._lfe_lowpass((L + R) * 0.316)
+        LFE = self._lfe_lowpass((L + R) * 0.316, key='upmix')
         
         # Apply Safe Dynamic EQ if enabled
         # Adds up to +4dB (1.58x) boost at extreme low volumes, tapering to 0dB at 0.5 peak
@@ -3715,43 +3780,12 @@ class AudioBypass:
                 if i % 2 == 0: out_block[:, i] = SL
                 else: out_block[:, i] = SR
 
-        # ─── Post-Routing Global Effects ───
-        
-        # Apply Global Radar Panning or Headphone Tracking Counter-Rotation
-        is_hp_tracking = getattr(self, 'headphone_tracking', False)
-        if getattr(self, 'independent_panning', False) or is_hp_tracking:
-            panning_x = self.gui_panning_x
-            if is_hp_tracking:
-                panning_x += getattr(self, '_dynamic_pan_offset', 0.0)
-                panning_x = max(-1.0, min(1.0, panning_x)) # Clamp to bounds
-                
-            bal_l = 1.0 - max(0, panning_x)
-            bal_r = 1.0 - max(0, -panning_x)
-            
-            # Apply to all lefts and all rights based on channel format
-            out_block[:, 0] *= bal_l
-            out_block[:, 1] *= bal_r
-            if out_ch > 4:
-                out_block[:, 4] *= bal_l
-                out_block[:, 5] *= bal_r
-            if out_ch > 6:
-                out_block[:, 6] *= bal_l
-                out_block[:, 7] *= bal_r
-
-        # ─── Post-Upmix Effects Pipeline ───
-        self._apply_post_effects(out_block, out_block.shape[1], skip_subsynth=force_passthrough, src_block=src_block)
-
-        # Output peak limiter (all channels)
-        out_block = self._apply_true_peak_limiter(out_block)
-
-        return out_block
-
-    def _lfe_lowpass(self, sig):
-        """120 Hz low-pass for bass redirected to the LFE channel (stateful)."""
+    def _lfe_lowpass(self, sig, key='lfe'):
+        """120 Hz low-pass for bass redirected to the LFE channel (stateful per route)."""
         if getattr(self, '_lfe_lp_sos', None) is None:
             self._init_multiband_filters()
-        zi = self._ensure_sos_zi(self._lfe_lp_zi, 'lfe', self._lfe_lp_sos)
-        out, self._lfe_lp_zi['lfe'] = sosfilt(self._lfe_lp_sos, sig, zi=zi)
+        zi = self._ensure_sos_zi(self._lfe_lp_zi, key, self._lfe_lp_sos)
+        out, self._lfe_lp_zi[key] = sosfilt(self._lfe_lp_sos, sig, zi=zi)
         return out.astype(np.float32)
 
     def _read_input_block(self, frames):
