@@ -12,7 +12,7 @@ import time
 import argparse
 import numpy as np
 import json
-from adaptive_control import AdaptiveController
+from adaptive_control import ADAPTIVE_PARAMS, AdaptiveController
 from adaptive_renderer import AdaptiveFeatureEngine
 from xpdss_state import (
     apply_adaptive_state_to_object,
@@ -33,6 +33,7 @@ IS_WINDOWS = sys.platform == 'win32'
 # Constants for detection
 SURROUND_SILENCE_FLOOR = 10 ** (-70 / 20)  # center/surround RMS above this = real content
 STABILITY_WINDOW = 3.0
+ANALYSIS_STRIDE = 5     # every Nth input block goes to the analysis thread
 CHECK_INTERVAL = 0.2
 BLOCK_SIZE = 0           # 0 allows WASAPI to choose the most stable hardware buffer
 
@@ -234,15 +235,13 @@ class AudioBypass:
         self._secondary_drift_fill_ema = None
         self._secondary_output_primed = False
         apply_secondary_output_state_to_object(self, {})
-        self.adaptive_monitor_enabled = True
-        self.adaptive_observe_only = True
+        # Adaptive renderer: one on/off switch (saved); live values and pins are runtime only
+        self.adaptive_enabled = False
         self.adaptive_snapshot = {}
-        self.adaptive_engine = AdaptiveFeatureEngine(self.sample_rate, smoothing=0.85)
-        self.adaptive_mode = "observe"
-        self.adaptive_profile = "neutral"
-        self.adaptive_compare_bypass = False
-        self.adaptive_state = {}
-        self.adaptive_controller = AdaptiveController(smoothing=0.82)
+        self.adaptive_values = {}      # live amounts per slider while adaptive (or its glide back) runs
+        self.adaptive_pinned = set()   # sliders the user dragged while adaptive was on
+        self.adaptive_engine = AdaptiveFeatureEngine(self.sample_rate)
+        self.adaptive_controller = AdaptiveController()
         
         # Profile-scoped settings (upmix, enhancements, head tracking geometry...)
         # live in xpdss_state.PROFILE_DEFAULTS and are applied below by
@@ -575,19 +574,10 @@ class AudioBypass:
                             self.correlation_smooth = self.correlation_smooth * 0.95 + abs(corr) * 0.05
                     except Exception: pass
 
-                if getattr(self, 'adaptive_monitor_enabled', False) and getattr(self, 'adaptive_engine', None):
-                    try:
-                        snapshot = self.adaptive_engine.analyze_block(data)
-                        self.adaptive_snapshot = snapshot.to_dict()
-                        if getattr(self, 'adaptive_controller', None):
-                            state = self.adaptive_controller.update(
-                                self.adaptive_snapshot,
-                                output_mode=getattr(self, 'current_mode', 'speakers'),
-                                profile=getattr(self, 'adaptive_profile', 'neutral'),
-                            )
-                            self._publish_adaptive_state(state)
-                    except Exception as adaptive_error:
-                        print(f"Adaptive analysis error: {adaptive_error}")
+                try:
+                    self._adaptive_step(data, frames * ANALYSIS_STRIDE / self.sample_rate)
+                except Exception as adaptive_error:
+                    print(f"Adaptive analysis error: {adaptive_error}")
 
                 if time.time() - self.last_active_time > STABILITY_WINDOW:
                     self.is_multichannel_detected = False
@@ -639,94 +629,62 @@ class AudioBypass:
     def get_adaptive_snapshot(self):
         return dict(getattr(self, 'adaptive_snapshot', {}))
 
-    def get_adaptive_state(self):
-        return dict(getattr(self, 'adaptive_state', {}))
+    # ─── Adaptive renderer ──────────────────────────────────────────────
+    # While adaptive is on, the amount sliders of the enhancement effects
+    # follow the input (see adaptive_control). The profile attributes keep
+    # the user's own values, which are what gets saved; the live values sit
+    # in `adaptive_values`. A slider the user drags is pinned to its manual
+    # value until adaptive is switched off and on again.
 
-    def _adaptive_strength(self):
-        if not getattr(self, 'adaptive_monitor_enabled', False):
-            return 0.0
-        if getattr(self, 'adaptive_compare_bypass', False):
-            return 0.0
-        mode = getattr(self, 'adaptive_mode', 'observe')
-        if mode == 'assist':
-            return 0.45
-        if mode == 'full':
-            return 1.0
-        return 0.0
+    def _manual_adaptive_values(self):
+        return {key: float(getattr(self, key)) for key in ADAPTIVE_PARAMS}
 
-    def _adaptive_value(self, key, fallback, state=None):
-        strength = self._adaptive_strength()
-        if strength <= 0.0:
-            return fallback
-        source = state if state is not None else getattr(self, 'adaptive_state', {})
-        target = (source or {}).get('targets', {}).get(key)
-        if target is None or isinstance(target, bool):
-            return fallback
-        return float(fallback) * (1.0 - strength) + float(target) * strength
+    def _live_param(self, key):
+        """Value an effect should use right now: adaptive unless pinned/off."""
+        if key not in self.adaptive_pinned:
+            value = self.adaptive_values.get(key)
+            if value is not None:
+                return value
+        return getattr(self, key)
 
-    def _adaptive_bool(self, key, fallback=False, state=None):
-        strength = self._adaptive_strength()
-        if strength <= 0.0:
-            return fallback
-        source = state if state is not None else getattr(self, 'adaptive_state', {})
-        target = (source or {}).get('targets', {}).get(key)
-        if target is None:
-            return fallback
-        if strength < 1.0:
-            return bool(fallback)
-        return bool(target)
+    def is_adaptive_driven(self, key):
+        return bool(self.adaptive_enabled and key in ADAPTIVE_PARAMS and key not in self.adaptive_pinned)
 
-    def _adaptive_passthrough_active(self):
-        return bool(
-            (self.is_multichannel_detected and not self.manual_upmix)
-            or self.current_channels <= 2
-            or not self.upmix_enabled
-        )
+    def set_adaptive_enabled(self, enabled):
+        enabled = bool(enabled)
+        if enabled == self.adaptive_enabled:
+            return
+        self.adaptive_pinned = set()
+        if enabled:
+            # Start from the user's values so the sliders glide, not jump
+            self.adaptive_controller.reset(self._manual_adaptive_values())
+            self.adaptive_values = self.adaptive_controller.values()
+        self.adaptive_enabled = enabled
+        self.save_config()
 
-    def _adaptive_target_supported(self, key):
-        out_ch = getattr(self, 'current_channels', 2)
-        mode = getattr(self, 'current_mode', 'speakers')
-        passthrough = self._adaptive_passthrough_active()
-        if key in {'clarity_amount', 'virtual_room_mix', 'air_amount', 'micro_dyn_amount', 'transient_amount'}:
-            return True
-        if key == 'width_factor':
-            return mode == 'speakers' and out_ch > 2 and not passthrough
-        if key in {'dialogue_focus', 'vocal_lock'}:
-            return out_ch > 2
-        if key == 'hp_externalization':
-            return mode == 'headphones' and out_ch >= 2
-        return False
+    def set_manual_param(self, key, value):
+        """A user edit of a slider. While adaptive is on, it pins that slider."""
+        setattr(self, key, value)
+        if self.adaptive_enabled and key in ADAPTIVE_PARAMS:
+            self.adaptive_pinned = self.adaptive_pinned | {key}
 
-    def _build_adaptive_applied_targets(self, state_dict=None):
-        source_state = state_dict if isinstance(state_dict, dict) else (getattr(self, 'adaptive_state', {}) or {})
-        applied = {}
-        supported = {}
-        defaults = {
-            'clarity_amount': getattr(self, 'clarity_amount', 4.0),
-            'width_factor': getattr(self, 'width_factor', 1.0),
-            'virtual_room_mix': getattr(self, 'virtual_room_mix', 0.25),
-            'air_amount': getattr(self, 'air_amount', 0.3),
-            'micro_dyn_amount': getattr(self, 'micro_dyn_amount', 4.0),
-            'transient_amount': getattr(self, 'transient_amount', 4.0),
-            'dialogue_focus': getattr(self, 'dialogue_focus', False),
-            'vocal_lock': getattr(self, 'vocal_lock', False),
-            'hp_externalization': getattr(self, 'hp_externalization', False),
-        }
-        for key, fallback in defaults.items():
-            supported[key] = self._adaptive_target_supported(key)
-            if isinstance(fallback, bool):
-                applied[key] = self._adaptive_bool(key, fallback, source_state) if supported[key] else bool(fallback)
-            else:
-                applied[key] = self._adaptive_value(key, fallback, source_state) if supported[key] else float(fallback)
-        return applied, supported
-
-    def _publish_adaptive_state(self, state):
-        state_dict = state.to_dict() if hasattr(state, 'to_dict') else dict(state or {})
-        applied_targets, supported_targets = self._build_adaptive_applied_targets(state_dict)
-        state_dict['applied_targets'] = applied_targets
-        state_dict['target_support'] = supported_targets
-        self.adaptive_state = state_dict
-        return state_dict
+    def _adaptive_step(self, data, dt):
+        """Analysis-thread step: update measurements, then the live values."""
+        snapshot = self.adaptive_engine.analyze_block(data, dt=dt)
+        if snapshot is not None:
+            self.adaptive_snapshot = snapshot.to_dict()
+        if self.adaptive_enabled:
+            if not self.adaptive_values:
+                self.adaptive_controller.reset(self._manual_adaptive_values())
+            # Silence holds the values (no drifting during pauses)
+            fresh = self.adaptive_engine.last_block_active
+            self.adaptive_values = self.adaptive_controller.update(
+                self.adaptive_snapshot if fresh else None, dt,
+                output_mode=getattr(self, 'current_mode', 'speakers'))
+        elif self.adaptive_values:
+            # Switched off: glide back to the user's values, then hand over
+            done = self.adaptive_controller.glide_to(self._manual_adaptive_values(), dt)
+            self.adaptive_values = {} if done else self.adaptive_controller.values()
 
     def _valid_sos(self, sos):
         """True when a SciPy SOS filter is initialized and safe for sosfilt."""
@@ -1717,7 +1675,7 @@ class AudioBypass:
 
         # Map ratio to gain: 1.0 = sustained (no boost), above 1.2 = onset.
         # 20% dead zone filters out minor envelope wobble from normal dynamics
-        transient_amount = self._adaptive_value('transient_amount', getattr(self, 'transient_amount', 4.0))
+        transient_amount = self._live_param('transient_amount')
         max_boost = 10.0 ** (transient_amount / 20.0)
         raw_gain = 1.0 + gate * (max_boost - 1.0) * np.clip(
             (ratio - 1.2) / (2.5 - 1.2), 0.0, 1.0)
@@ -1791,7 +1749,7 @@ class AudioBypass:
         if n_samp < 64:
             return
 
-        max_boost_db = self._adaptive_value('micro_dyn_amount', getattr(self, 'micro_dyn_amount', 4.0))
+        max_boost_db = self._live_param('micro_dyn_amount')
 
         # ── Lazy-init state ──
         if not hasattr(self, '_ud_ref_db') or len(self._ud_ref_db) != n_ch:
@@ -2058,7 +2016,7 @@ class AudioBypass:
         threshold = 0.40
         sensitivity = 2.0 # Response aggressiveness
         
-        clarity_amount = self._adaptive_value('clarity_amount', getattr(self, 'clarity_amount', 4.0))
+        clarity_amount = self._live_param('clarity_amount')
         max_blend = np.clip(clarity_amount / 12.0, 0.08, 0.55)
         target_attenuation = 0.0
         if ratio > threshold:
@@ -2129,7 +2087,7 @@ class AudioBypass:
             reflections[:, ch], self._room_lp_zi[ch] = sosfilt(self._room_lp_sos, reflections[:, ch], zi=zi)
             
         # 5. Mix back
-        mix = self._adaptive_value('virtual_room_mix', getattr(self, 'virtual_room_mix', 0.25))
+        mix = self._live_param('virtual_room_mix')
         # Normalize sum of reflections (Sum of gains ~ 1.2)
         reflections *= 0.5 
         
@@ -2168,7 +2126,7 @@ class AudioBypass:
         excited += harmonics
 
         # 3. Mix
-        amount = self._adaptive_value('air_amount', getattr(self, 'air_amount', 0.3))
+        amount = self._live_param('air_amount')
         block += excited * amount
 
     def _apply_post_effects(self, out_block, out_ch, skip_subsynth=False, src_block=None, is_passthrough=False):
@@ -2209,8 +2167,7 @@ class AudioBypass:
         #      is active since vocal_lock already applies its own adaptive boost).
         #      Always called on surround layouts so the boost ramps in/out.
         if out_ch > 2:
-            focus_on = (self._adaptive_bool('dialogue_focus', getattr(self, 'dialogue_focus', False))
-                        and not self._adaptive_bool('vocal_lock', getattr(self, 'vocal_lock', False)))
+            focus_on = getattr(self, 'dialogue_focus', False) and not getattr(self, 'vocal_lock', False)
             self._apply_dialogue_focus(out_block, focus_on)
 
         # #13 Harmonic Bass Exciter (PBE) - Standalone toggle
@@ -2225,7 +2182,7 @@ class AudioBypass:
 
 
         # #5 Vocal Lock to Center
-        if self._adaptive_bool('vocal_lock', self.vocal_lock) and out_ch > 2:
+        if self.vocal_lock and out_ch > 2:
             self._apply_vocal_lock(out_block, frames)
 
         # #11 Subharmonic Synthesizer (Skip in passthrough)
@@ -2257,7 +2214,7 @@ class AudioBypass:
             self._apply_transaural_widener(out_block, frames)
 
         # #21 Headphone Externalization (after transaural, for HP mode)
-        if self._adaptive_bool('hp_externalization', getattr(self, 'hp_externalization', False)):
+        if getattr(self, 'hp_externalization', False):
             self._apply_hp_externalization(out_block)
 
         # #1 Independent Head Tracking Volume Panning (MUST RUN LAST for Absolute Room Alignment)
@@ -3099,7 +3056,7 @@ class AudioBypass:
             if "upmix_enabled" in data and not self.speakers_config:
                 legacy_excluded = {
                     "current_mode", "speakers", "headphones", "input_device", "output_device",
-                    "webcam_device", "webcam_index", "bypass_all", "adaptive_monitor_enabled",
+                    "webcam_device", "webcam_index", "bypass_all", "adaptive_enabled", "adaptive_monitor_enabled",
                     "adaptive_observe_only", "adaptive_mode", "adaptive_profile", "adaptive_compare_bypass",
                     "secondary_output", "secondary_output_enabled", "secondary_output_device",
                     "secondary_output_gain_db", "secondary_output_lowpass_hz", "secondary_output_highpass_hz",
@@ -3193,7 +3150,7 @@ class AudioBypass:
             self.widening_buffer_size = max(4096, int(self.sample_rate))
             self.widening_buffer = np.zeros(self.widening_buffer_size, dtype=np.float32)
             self.widening_write_ptr = 0
-            self.adaptive_engine = AdaptiveFeatureEngine(self.sample_rate, smoothing=0.85)
+            self.adaptive_engine = AdaptiveFeatureEngine(self.sample_rate)
             self._program_level_smooth = None
             self._rebuild_sub_drive_filter()
         self.refresh_secondary_output_filters()
@@ -3333,7 +3290,7 @@ class AudioBypass:
 
             # Throttled Analysis
             self.callback_count += 1
-            if self.callback_count % 5 == 0:
+            if self.callback_count % ANALYSIS_STRIDE == 0:
                 buf = self.buffer_pool[self.pool_index]
                 f = min(frames, buf.shape[0])
                 if buf.shape[1] == indata.shape[1]:
@@ -3586,7 +3543,7 @@ class AudioBypass:
 
         # Applied values stacked over sliders (or auto-pilot)
         ratio_z = getattr(self, '_dynamic_width_ratio', 1.0)
-        width_factor = self._adaptive_value('width_factor', self.width_factor)
+        width_factor = self.width_factor
         applied_width = max(0.5, min(2.0, width_factor * ratio_z))
         applied_spread = max(0.0, min(1.0, self.center_spread))
 

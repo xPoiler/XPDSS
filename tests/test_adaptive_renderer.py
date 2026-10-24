@@ -2,63 +2,69 @@ import numpy as np
 
 from adaptive_renderer import AdaptiveFeatureEngine
 
-
-def make_timebase(sample_rate=48000, seconds=0.25):
-    return np.arange(int(sample_rate * seconds), dtype=np.float32) / sample_rate
-
-
-def test_dialogue_like_mono_signal_scores_more_central_than_wide_stereo():
-    sr = 48000
-    t = make_timebase(sr)
-    voice = 0.4 * np.sin(2 * np.pi * 300 * t) + 0.25 * np.sin(2 * np.pi * 2300 * t)
-    mono_block = np.column_stack([voice, voice]).astype(np.float32)
-
-    width_l = 0.45 * np.sin(2 * np.pi * 300 * t)
-    width_r = 0.45 * np.sin(2 * np.pi * 300 * t + np.pi / 2)
-    air = 0.12 * np.sin(2 * np.pi * 9500 * t)
-    wide_block = np.column_stack([width_l + air, width_r - air]).astype(np.float32)
-
-    engine = AdaptiveFeatureEngine(sample_rate=sr, smoothing=0.0)
-    mono_snapshot = engine.analyze_block(mono_block)
-    wide_snapshot = engine.analyze_block(wide_block)
-
-    assert mono_snapshot.stereo_correlation > 0.90
-    assert mono_snapshot.side_ratio < 0.20
-    assert mono_snapshot.dialogue_score > wide_snapshot.dialogue_score
+SR = 48000
+BLOCK = 480
 
 
-def test_wide_stereo_signal_scores_more_immersive_than_mono_signal():
-    sr = 48000
-    t = make_timebase(sr)
-
-    mono = 0.45 * np.sin(2 * np.pi * 1000 * t)
-    mono_block = np.column_stack([mono, mono]).astype(np.float32)
-
-    left = 0.4 * np.sin(2 * np.pi * 700 * t)
-    right = 0.4 * np.sin(2 * np.pi * 1700 * t + np.pi / 3)
-    wide_block = np.column_stack([left, right]).astype(np.float32)
-
-    engine = AdaptiveFeatureEngine(sample_rate=sr, smoothing=0.0)
-    mono_snapshot = engine.analyze_block(mono_block)
-    wide_snapshot = engine.analyze_block(wide_block)
-
-    assert wide_snapshot.side_ratio > mono_snapshot.side_ratio
-    assert wide_snapshot.immersion_score > mono_snapshot.immersion_score
+def feed(engine, signal, stride=1):
+    """Feed a (frames, ch) signal block by block, as the analysis thread does."""
+    snap = None
+    for i in range(0, signal.shape[0] - BLOCK + 1, BLOCK * stride):
+        snap = engine.analyze_block(signal[i:i + BLOCK], dt=BLOCK * stride / SR)
+    return snap
 
 
-def test_clipped_signal_scores_more_compressed_than_dynamic_signal():
-    sr = 48000
-    t = make_timebase(sr)
+def stereo(left, right=None):
+    return np.column_stack([left, left if right is None else right]).astype(np.float32)
 
-    dynamic = 0.15 * np.sin(2 * np.pi * 220 * t)
-    dynamic += 0.75 * np.exp(-((t - 0.05) / 0.002) ** 2)
-    dynamic_block = np.column_stack([dynamic, dynamic]).astype(np.float32)
 
-    clipped = np.clip(1.8 * np.sin(2 * np.pi * 220 * t), -0.35, 0.35)
-    clipped_block = np.column_stack([clipped, clipped]).astype(np.float32)
+def tone(freq, seconds, amp=0.3, phase=0.0):
+    t = np.arange(int(SR * seconds)) / SR
+    return amp * np.sin(2 * np.pi * freq * t + phase)
 
-    engine = AdaptiveFeatureEngine(sample_rate=sr, smoothing=0.0)
-    dynamic_snapshot = engine.analyze_block(dynamic_block)
-    clipped_snapshot = engine.analyze_block(clipped_block)
 
-    assert clipped_snapshot.compression_score > dynamic_snapshot.compression_score
+def test_dialogue_like_mono_scores_more_central_than_wide_stereo():
+    voice = tone(300, 2, 0.4) + tone(2300, 2, 0.25)
+    wide = stereo(tone(300, 2, 0.45) + tone(9500, 2, 0.12), tone(300, 2, 0.45, np.pi / 2) - tone(9500, 2, 0.12))
+    mono_snap = feed(AdaptiveFeatureEngine(SR, tau=0.2), stereo(voice))
+    wide_snap = feed(AdaptiveFeatureEngine(SR, tau=0.2), wide)
+    assert mono_snap.stereo_correlation > 0.9
+    assert mono_snap.dialogue_score > wide_snap.dialogue_score
+    assert wide_snap.immersion_score > mono_snap.immersion_score
+
+
+def test_loudness_range_separates_compressed_from_dynamic_content():
+    rng = np.random.default_rng(0)
+    noise = rng.standard_normal(SR * 12) * 0.1
+    compressed = stereo(noise)
+    # dynamic: alternate loud / quiet (-16 dB) passages every 2 s
+    env = np.repeat(np.tile([1.0, 0.16], 3), SR * 2)
+    dynamic = stereo(noise * env)
+    c = feed(AdaptiveFeatureEngine(SR), compressed, stride=5)
+    d = feed(AdaptiveFeatureEngine(SR), dynamic, stride=5)
+    assert c.dynamic_range_db < 2.0 and c.compression_score > 0.9
+    assert d.dynamic_range_db > 12.0 and d.compression_score < 0.1
+
+
+def test_tonal_balance_scores():
+    muddy = feed(AdaptiveFeatureEngine(SR, tau=0.2), stereo(tone(350, 2) + tone(3000, 2, 0.05)))
+    bright = feed(AdaptiveFeatureEngine(SR, tau=0.2), stereo(tone(3000, 2) + tone(10000, 2, 0.2)))
+    assert muddy.mud_score > 0.8 > bright.mud_score
+    assert bright.air_score > muddy.air_score
+
+
+def test_silence_is_ignored_and_holds_measurements():
+    engine = AdaptiveFeatureEngine(SR, tau=0.2)
+    assert feed(engine, stereo(np.zeros(SR))) is None
+    snap = feed(engine, stereo(tone(350, 1)))
+    held = feed(engine, stereo(np.zeros(SR)))
+    assert held == snap
+    assert engine.last_block_active is False
+
+
+def test_measurements_change_slowly():
+    engine = AdaptiveFeatureEngine(SR, tau=3.0)
+    feed(engine, stereo(tone(3000, 4)))
+    before = engine.latest_snapshot().mud_score
+    after = feed(engine, stereo(tone(350, 0.5))).mud_score   # half a second of mud
+    assert after - before < 0.5 * (1.0 - before)

@@ -56,11 +56,10 @@ PROFILE_DEFAULTS: Dict[str, Any] = {
 }
 
 ADAPTIVE_DEFAULTS: Dict[str, Any] = {
-    "adaptive_monitor_enabled": True,
-    "adaptive_observe_only": True,
-    "adaptive_mode": "observe",
-    "adaptive_profile": "neutral",
-    "adaptive_compare_bypass": False,
+    # Single switch: the adaptive renderer drives the amount sliders of the
+    # enabled enhancement effects. (Older keys - adaptive_mode / profile /
+    # compare - are ignored when loading.)
+    "adaptive_enabled": False,
 }
 
 SECONDARY_OUTPUT_DEFAULTS: Dict[str, Any] = {

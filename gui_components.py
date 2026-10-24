@@ -228,6 +228,8 @@ class LabeledSlider(QWidget):
         self.max_val = max_val
         self.is_int = is_int
 
+        self._value = float(initial_val)
+        self._auto_state = None
         self.lbl_title = QLabel(f"{label}:")
         self.lbl_title.setStyleSheet("color: #888; font-size: 11px; font-weight: bold; min-width: 100px;")
 
@@ -269,6 +271,7 @@ class LabeledSlider(QWidget):
 
     def _on_value_changed(self, pos):
         val = self.min_val + (pos / 100.0) * (self.max_val - self.min_val)
+        self._value = val
         self.input_val.setText(self._format_val(val))
         self.valueChanged.emit(val)
 
@@ -282,6 +285,7 @@ class LabeledSlider(QWidget):
             self.slider.setValue(int(norm_val * 100))
             self.slider.blockSignals(False)
             self.input_val.setText(self._format_val(val))
+            self._value = val
             self.valueChanged.emit(val)
             self.input_val.clearFocus()
         except ValueError:
@@ -289,7 +293,21 @@ class LabeledSlider(QWidget):
             val = self.min_val + (pos / 100.0) * (self.max_val - self.min_val)
             self.input_val.setText(self._format_val(val))
 
+    def current_value(self):
+        return self._value
+
+    def set_auto_state(self, state):
+        """None (manual), 'auto' (moved by the adaptive renderer) or 'pinned'."""
+        if state == self._auto_state:
+            return
+        self._auto_state = state
+        suffix = {'auto': ' (auto)', 'pinned': ' (pinned)'}.get(state, '')
+        color = {'auto': '#00e5ff', 'pinned': '#ffaa44'}.get(state, '#888')
+        self.lbl_title.setText(f"{self.label_txt}{suffix}:")
+        self.lbl_title.setStyleSheet(f"color: {color}; font-size: 11px; font-weight: bold; min-width: 100px;")
+
     def set_value(self, val):
+        self._value = float(val)
         norm_val = (val - self.min_val) / (self.max_val - self.min_val)
         self.slider.blockSignals(True)
         self.slider.setValue(int(norm_val * 100))
@@ -416,54 +434,22 @@ class UpmixerWindow(QMainWindow):
         self.btn_ind.toggled.connect(self.toggle_independent)
         right_panel.addWidget(self.btn_ind)
 
-        # ── Adaptive Renderer Controls ──
+        # ── Adaptive Renderer: one switch ──
         right_panel.addWidget(_make_section_label("ADAPTIVE RENDERER"))
-        adaptive_mode_layout = QHBoxLayout()
-        adaptive_mode_layout.setSpacing(5)
-        self.adaptive_mode_group = QButtonGroup(self)
-        self.btn_adapt_observe = QPushButton("OBSERVE")
-        self.btn_adapt_assist = QPushButton("ASSIST")
-        self.btn_adapt_full = QPushButton("FULL")
-        for btn in (self.btn_adapt_observe, self.btn_adapt_assist, self.btn_adapt_full):
-            btn.setCheckable(True)
-            btn.setStyleSheet(btn_sm)
-            adaptive_mode_layout.addWidget(btn)
-            self.adaptive_mode_group.addButton(btn)
-        self.btn_adapt_observe.clicked.connect(lambda: self.set_adaptive_mode("observe"))
-        self.btn_adapt_assist.clicked.connect(lambda: self.set_adaptive_mode("assist"))
-        self.btn_adapt_full.clicked.connect(lambda: self.set_adaptive_mode("full"))
-        right_panel.addLayout(adaptive_mode_layout)
+        self.btn_adaptive = QPushButton("ADAPTIVE")
+        self.btn_adaptive.setCheckable(True)
+        self.btn_adaptive.setStyleSheet(btn_sm)
+        self.btn_adaptive.setToolTip(
+            "Moves the amount sliders of the effects you enabled (clarity, transient,\n"
+            "micro-dyn, air, room mix) to suit the input, in real time.\n"
+            "Never toggles effects or changes where sounds come from.\n"
+            "Dragging a slider pins it; switch adaptive off and on to release pins.")
+        self.btn_adaptive.toggled.connect(self.toggle_adaptive)
+        right_panel.addWidget(self.btn_adaptive)
 
-        adaptive_profile_layout = QGridLayout()
-        adaptive_profile_layout.setSpacing(4)
-        self.adaptive_profile_group = QButtonGroup(self)
-        self.btn_profile_neutral = QPushButton("NEUTRAL")
-        self.btn_profile_cinema = QPushButton("CINEMA")
-        self.btn_profile_music = QPushButton("MUSIC")
-        self.btn_profile_night = QPushButton("NIGHT")
-        profile_buttons = [
-            (self.btn_profile_neutral, "neutral"),
-            (self.btn_profile_cinema, "cinema"),
-            (self.btn_profile_music, "music"),
-            (self.btn_profile_night, "night"),
-        ]
-        for i, (btn, profile_name) in enumerate(profile_buttons):
-            btn.setCheckable(True)
-            btn.setStyleSheet(btn_sm)
-            btn.clicked.connect(lambda _=False, p=profile_name: self.set_adaptive_profile(p))
-            self.adaptive_profile_group.addButton(btn)
-            adaptive_profile_layout.addWidget(btn, i // 2, i % 2)
-        right_panel.addLayout(adaptive_profile_layout)
-
-        self.btn_adaptive_compare = QPushButton("A/B STATIC REFERENCE")
-        self.btn_adaptive_compare.setCheckable(True)
-        self.btn_adaptive_compare.setStyleSheet(btn_sm)
-        self.btn_adaptive_compare.toggled.connect(self.toggle_adaptive_compare)
-        right_panel.addWidget(self.btn_adaptive_compare)
-
-        self.lbl_adaptive = QLabel("Adaptive telemetry offline")
+        self.lbl_adaptive = QLabel("")
         self.lbl_adaptive.setWordWrap(True)
-        self.lbl_adaptive.setStyleSheet("color: #66d9ef; font-family: monospace; font-size: 10px; background: #101820; border: 1px solid #223344; padding: 8px;")
+        self.lbl_adaptive.setStyleSheet("color: #66d9ef; font-family: monospace; font-size: 10px; background: #101820; border: 1px solid #223344; padding: 6px;")
         right_panel.addWidget(self.lbl_adaptive)
         self.refresh_adaptive_ui()
 
@@ -559,23 +545,23 @@ class UpmixerWindow(QMainWindow):
         right_panel.addWidget(self.sld_sub_cutoff)
 
         self.sld_transient = LabeledSlider("Transient Boost", 1.0, 12.0, getattr(audio_app, 'transient_amount', 4.0), suffix=" dB")
-        self.sld_transient.valueChanged.connect(lambda v: (setattr(self.audio_app, "transient_amount", v), self.request_save()))
+        self.sld_transient.valueChanged.connect(lambda v: self._on_adaptive_slider('transient_amount', v))
         right_panel.addWidget(self.sld_transient)
 
         self.sld_micro_dyn = LabeledSlider("Micro-Dyn Uplift", 1.0, 12.0, getattr(audio_app, 'micro_dyn_amount', 4.0), suffix=" dB")
-        self.sld_micro_dyn.valueChanged.connect(lambda v: (setattr(self.audio_app, "micro_dyn_amount", v), self.request_save()))
+        self.sld_micro_dyn.valueChanged.connect(lambda v: self._on_adaptive_slider('micro_dyn_amount', v))
         right_panel.addWidget(self.sld_micro_dyn)
 
         self.sld_clarity = LabeledSlider("Clarity Atten.", 1.0, 6.0, getattr(audio_app, 'clarity_amount', 4.0), suffix=" dB")
-        self.sld_clarity.valueChanged.connect(lambda v: (setattr(self.audio_app, "clarity_amount", v), self.request_save()))
+        self.sld_clarity.valueChanged.connect(lambda v: self._on_adaptive_slider('clarity_amount', v))
         right_panel.addWidget(self.sld_clarity)
 
         self.sld_room_mix = LabeledSlider("Room Mix", 0.0, 100.0, getattr(audio_app, 'virtual_room_mix', 0.25) * 100.0, suffix="%", is_int=True)
-        self.sld_room_mix.valueChanged.connect(lambda v: (setattr(self.audio_app, "virtual_room_mix", v / 100.0), self.request_save()))
+        self.sld_room_mix.valueChanged.connect(lambda v: self._on_adaptive_slider('virtual_room_mix', v / 100.0))
         right_panel.addWidget(self.sld_room_mix)
 
         self.sld_air = LabeledSlider("Air Gain", 0.0, 100.0, getattr(audio_app, 'air_amount', 0.3) * 100.0, suffix="%", is_int=True)
-        self.sld_air.valueChanged.connect(lambda v: (setattr(self.audio_app, "air_amount", v / 100.0), self.request_save()))
+        self.sld_air.valueChanged.connect(lambda v: self._on_adaptive_slider('air_amount', v / 100.0))
         right_panel.addWidget(self.sld_air)
 
         self.sld_trans_delay = LabeledSlider("XTC Delay", 0.0, 30.0, getattr(audio_app, 'transaural_delay', 7), suffix=" smp", is_int=True)
@@ -815,22 +801,14 @@ class UpmixerWindow(QMainWindow):
         self.radar.set_independent_panning(checked)
         self.request_save()
 
-    def set_adaptive_mode(self, mode):
-        self.audio_app.adaptive_mode = mode
-        self.audio_app.adaptive_monitor_enabled = True
-        self.audio_app.adaptive_observe_only = (mode == 'observe')
-        self.request_save()
+    def toggle_adaptive(self, checked):
+        self.audio_app.set_adaptive_enabled(checked)
         self.refresh_adaptive_ui()
 
-    def set_adaptive_profile(self, profile_name):
-        self.audio_app.adaptive_profile = profile_name
+    def _on_adaptive_slider(self, attr, value):
+        """User edit of an amount slider: pins it while adaptive is on."""
+        self.audio_app.set_manual_param(attr, value)
         self.request_save()
-        self.refresh_adaptive_ui()
-
-    def toggle_adaptive_compare(self, checked):
-        self.audio_app.adaptive_compare_bypass = checked
-        self.request_save()
-        self.refresh_adaptive_ui()
 
     def toggle_secondary_output(self, checked):
         self.audio_app.set_secondary_output_enabled(checked)
@@ -853,36 +831,10 @@ class UpmixerWindow(QMainWindow):
         self.request_save()
 
     def refresh_adaptive_ui(self):
-        mode = getattr(self.audio_app, 'adaptive_mode', 'observe')
-        profile = getattr(self.audio_app, 'adaptive_profile', 'neutral')
-        compare = getattr(self.audio_app, 'adaptive_compare_bypass', False)
-        mode_buttons = {
-            'observe': getattr(self, 'btn_adapt_observe', None),
-            'assist': getattr(self, 'btn_adapt_assist', None),
-            'full': getattr(self, 'btn_adapt_full', None),
-        }
-        for key, btn in mode_buttons.items():
-            if btn:
-                btn.blockSignals(True)
-                btn.setChecked(key == mode)
-                btn.blockSignals(False)
-
-        profile_buttons = {
-            'neutral': getattr(self, 'btn_profile_neutral', None),
-            'cinema': getattr(self, 'btn_profile_cinema', None),
-            'music': getattr(self, 'btn_profile_music', None),
-            'night': getattr(self, 'btn_profile_night', None),
-        }
-        for key, btn in profile_buttons.items():
-            if btn:
-                btn.blockSignals(True)
-                btn.setChecked(key == profile)
-                btn.blockSignals(False)
-
-        if hasattr(self, 'btn_adaptive_compare'):
-            self.btn_adaptive_compare.blockSignals(True)
-            self.btn_adaptive_compare.setChecked(compare)
-            self.btn_adaptive_compare.blockSignals(False)
+        if hasattr(self, 'btn_adaptive'):
+            self.btn_adaptive.blockSignals(True)
+            self.btn_adaptive.setChecked(getattr(self.audio_app, 'adaptive_enabled', False))
+            self.btn_adaptive.blockSignals(False)
 
     def sync_ui_from_backend(self):
         """Synchronize all GUI widget values from the active profile state."""
@@ -965,10 +917,7 @@ class UpmixerWindow(QMainWindow):
         if hasattr(self, 'btn_import'): self.btn_import.setDisabled(is_bypass)
         if hasattr(self, 'btn_export'): self.btn_export.setDisabled(is_bypass)
         if hasattr(self, 'btn_calibrate'): self.btn_calibrate.setDisabled(is_bypass)
-        if hasattr(self, 'btn_adapt_observe'): self.btn_adapt_observe.setDisabled(is_bypass)
-        if hasattr(self, 'btn_adapt_assist'): self.btn_adapt_assist.setDisabled(is_bypass)
-        if hasattr(self, 'btn_adapt_full'): self.btn_adapt_full.setDisabled(is_bypass)
-        if hasattr(self, 'btn_adaptive_compare'): self.btn_adaptive_compare.setDisabled(is_bypass)
+        if hasattr(self, 'btn_adaptive'): self.btn_adaptive.setDisabled(is_bypass)
 
         if hasattr(self, 'option_buttons'):
             for b in self.option_buttons.values():
@@ -1191,31 +1140,7 @@ class UpmixerWindow(QMainWindow):
         peaks = getattr(self.audio_app, 'last_peaks', [0.0]*8)
         self.radar.set_peaks(peaks)
 
-        snapshot = getattr(self.audio_app, 'get_adaptive_snapshot', lambda: {})()
-        state = getattr(self.audio_app, 'get_adaptive_state', lambda: {})()
-        if hasattr(self, 'lbl_adaptive'):
-            mode = getattr(self.audio_app, 'adaptive_mode', 'observe').upper()
-            profile = getattr(self.audio_app, 'adaptive_profile', 'neutral').upper()
-            compare = 'STATIC A/B' if getattr(self.audio_app, 'adaptive_compare_bypass', False) else 'ADAPTIVE'
-            raw_targets = state.get('targets', {}) if isinstance(state, dict) else {}
-            applied_targets = state.get('applied_targets', raw_targets) if isinstance(state, dict) else {}
-            support = state.get('target_support', {}) if isinstance(state, dict) else {}
-            bool_summary = [
-                f"focus={'ON' if applied_targets.get('dialogue_focus', False) else 'off'}",
-                f"vocal={'ON' if applied_targets.get('vocal_lock', False) else 'off'}",
-                f"center_manual={'ON' if getattr(self.audio_app, 'center_extraction', False) else 'off'}",
-                f"hp_ext={'ON' if applied_targets.get('hp_externalization', False) else 'off'}",
-            ]
-            limited = [name for name, enabled in support.items() if not enabled and name in raw_targets]
-            limit_note = f"\nobserve-only/no-op: {', '.join(limited)}" if limited else ""
-            self.lbl_adaptive.setText(
-                f"MODE: {mode} | PROFILE: {profile} | {compare}\n"
-                f"dialogue={snapshot.get('dialogue_score', 0.0):.2f}  immersion={snapshot.get('immersion_score', 0.0):.2f}  compression={snapshot.get('compression_score', 0.0):.2f}\n"
-                f"mud={snapshot.get('mud_score', 0.0):.2f}  air={snapshot.get('air_score', 0.0):.2f}  surround={snapshot.get('surround_discreteness', 0.0):.2f}\n"
-                f"clarity={applied_targets.get('clarity_amount', 0.0):.2f}  width={applied_targets.get('width_factor', 0.0):.2f}  room={applied_targets.get('virtual_room_mix', 0.0):.2f}\n"
-                f"air_amt={applied_targets.get('air_amount', 0.0):.2f}  micro={applied_targets.get('micro_dyn_amount', 0.0):.2f}  transient={applied_targets.get('transient_amount', 0.0):.2f}\n"
-                f"{'  '.join(bool_summary)}{limit_note}"
-            )
+        self._update_adaptive_display()
 
         if hasattr(self, 'lbl_secondary_status'):
             enabled = getattr(self.audio_app, 'secondary_output_enabled', False)
@@ -1228,6 +1153,49 @@ class UpmixerWindow(QMainWindow):
                 f"source={source}  mode={mode}\n"
                 f"gain={getattr(self.audio_app, 'secondary_output_gain_db', 0.0):.2f} dB  lp={getattr(self.audio_app, 'secondary_output_lowpass_hz', 80.0):.1f} Hz  hp={getattr(self.audio_app, 'secondary_output_highpass_hz', 20.0):.1f} Hz  delay={getattr(self.audio_app, 'secondary_output_delay_ms', 0.0):.1f} ms"
             )
+
+    # Amount sliders driven by the adaptive renderer: attr -> (slider, display transform)
+    ADAPTIVE_SLIDERS = {
+        'clarity_amount': ('sld_clarity', 1.0),
+        'transient_amount': ('sld_transient', 1.0),
+        'micro_dyn_amount': ('sld_micro_dyn', 1.0),
+        'air_amount': ('sld_air', 100.0),
+        'virtual_room_mix': ('sld_room_mix', 100.0),
+    }
+
+    def _update_adaptive_display(self):
+        app = self.audio_app
+        enabled = getattr(app, 'adaptive_enabled', False)
+        pinned = getattr(app, 'adaptive_pinned', set())
+        for attr, (sld_name, scale) in self.ADAPTIVE_SLIDERS.items():
+            sld = getattr(self, sld_name, None)
+            if sld is None:
+                continue
+            if enabled:
+                sld.set_auto_state('pinned' if attr in pinned else 'auto')
+            else:
+                sld.set_auto_state(None)
+            # Show the live value (also while gliding back after switching off)
+            if attr not in pinned and not sld.slider.isSliderDown():
+                live = app._live_param(attr)
+                if abs(live * scale - sld.current_value()) > 1e-6:
+                    sld.set_value(live * scale)
+
+        if hasattr(self, 'lbl_adaptive'):
+            if not enabled:
+                self.lbl_adaptive.setVisible(False)
+                return
+            self.lbl_adaptive.setVisible(True)
+            snap = app.get_adaptive_snapshot()
+            if not snap:
+                self.lbl_adaptive.setText("waiting for signal...")
+                return
+            dyn = snap.get('dynamic_range_db', float('nan'))
+            dyn_txt = "measuring" if dyn != dyn else f"{dyn:.1f} dB"
+            held = "" if app.adaptive_engine.last_block_active else "  (silence: holding)"
+            self.lbl_adaptive.setText(
+                f"dynamics {dyn_txt}  mud {snap.get('mud_score', 0):.2f}  air {snap.get('air_score', 0):.2f}\n"
+                f"dialogue {snap.get('dialogue_score', 0):.2f}  spaciousness {snap.get('immersion_score', 0):.2f}{held}")
 
     def start_calibration(self):
         from PySide6.QtWidgets import QDialog

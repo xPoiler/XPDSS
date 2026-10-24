@@ -116,12 +116,12 @@ ALL_TOGGLES = [k for k, v in PROFILE_DEFAULTS.items() if isinstance(v, bool)
                and k not in ("head_tracking_preview", "manual_upmix", "independent_panning")]
 
 
-@pytest.mark.parametrize("mode", ["observe", "full"])
-def test_everything_enabled_with_changing_layouts(engine, mode):
+@pytest.mark.parametrize("adaptive", [False, True])
+def test_everything_enabled_with_changing_layouts(engine, adaptive):
     for key in ALL_TOGGLES:
         setattr(engine, key, True)
     engine.headphone_tracking = False
-    engine.adaptive_mode = mode
+    engine.set_adaptive_enabled(adaptive)
     engine.head_tracker = types.SimpleNamespace(pos_x=0.05, pos_y=0.0, pos_z=1.1, rot_yaw=0.05)
     i = 0
     for out_ch in (8, 6, 2, 8):
@@ -167,8 +167,9 @@ def test_dynamic_eq_boosts_bass_at_low_level(engine):
     assert np.std(block[24000:, 0]) > 1.5 * np.std(s[24000:])
 
 
-def test_adaptive_full_mode_respects_disabled_modules(engine):
-    engine.adaptive_mode = "full"
+def test_adaptive_respects_disabled_modules(engine):
+    engine.set_adaptive_enabled(True)
+    engine.adaptive_values = {"virtual_room_mix": 0.3, "air_amount": 0.4, "clarity_amount": 5.0}
     engine.virtual_room = engine.air_exciter = engine.clarity_dsp = False
     block = noise(480, 2)
     ref = block.copy()
@@ -280,3 +281,99 @@ def test_calibration_uses_real_sample_rate():
     est_itd, k, _ = ch.calculate_transaural_params(L_FL, R_FL, L_FR, R_FR, sweep, sample_rate=sr)
     assert abs(est_itd - itd) <= 1
     assert 0.3 < k < 0.7
+
+
+# ── Adaptive renderer (single switch) ───────────────────────────────────
+
+def music(seconds, seed=0):
+    rng = np.random.default_rng(seed)
+    n = int(SR * seconds)
+    x = np.zeros((n, 8), dtype=np.float32)
+    t = np.arange(n) / SR
+    x[:, 0] = 0.2 * np.sin(2 * np.pi * 330 * t) + rng.standard_normal(n) * 0.05
+    x[:, 1] = 0.2 * np.sin(2 * np.pi * 330 * t + 0.3) + rng.standard_normal(n) * 0.05
+    return x
+
+
+def run_analysis(app, x, stride=aa.ANALYSIS_STRIDE):
+    for i in range(0, x.shape[0] - 480 + 1, 480 * stride):
+        app._adaptive_step(x[i:i + 480], 480 * stride / SR)
+
+
+def test_adaptive_starts_from_manual_values_and_moves_them(engine):
+    manual = engine._manual_adaptive_values()
+    engine.set_adaptive_enabled(True)
+    assert engine.adaptive_values == pytest.approx(manual)
+    run_analysis(engine, music(20))
+    moved = {k for k in manual if abs(engine._live_param(k) - manual[k]) > 0.05 * max(1.0, manual[k])}
+    assert moved, "adaptive should have moved at least one slider"
+    # the user's own values are untouched (and are what gets saved)
+    assert engine._manual_adaptive_values() == manual
+
+
+def test_adaptive_never_touches_toggles_or_sound_locations(engine):
+    keys = ["width_factor", "center_spread", "side_gain_db", "gui_panning_x", "gui_panning_y",
+            "transaural_gain", "transaural_delay", "sub_gain"] + [k for k, v in PROFILE_DEFAULTS.items() if isinstance(v, bool)]
+    before = {k: getattr(engine, k) for k in keys}
+    engine.set_adaptive_enabled(True)
+    run_analysis(engine, music(15))
+    assert {k: getattr(engine, k) for k in keys} == before
+
+
+def test_dragging_a_slider_pins_it_until_adaptive_is_toggled(engine):
+    engine.set_adaptive_enabled(True)
+    run_analysis(engine, music(10))
+    engine.set_manual_param("clarity_amount", 2.0)
+    run_analysis(engine, music(10, seed=1))
+    assert engine._live_param("clarity_amount") == 2.0
+    assert not engine.is_adaptive_driven("clarity_amount")
+    engine.set_adaptive_enabled(False)
+    engine.set_adaptive_enabled(True)
+    assert engine.is_adaptive_driven("clarity_amount")
+
+
+def test_switching_off_glides_back_to_manual_values(engine):
+    manual = engine._manual_adaptive_values()
+    engine.set_adaptive_enabled(True)
+    run_analysis(engine, music(20))
+    engine.set_adaptive_enabled(False)
+    run_analysis(engine, music(0.3))
+    mid_glide = engine.adaptive_values
+    run_analysis(engine, music(5))
+    assert engine.adaptive_values == {}
+    assert {k: engine._live_param(k) for k in manual} == manual
+    assert mid_glide, "values should glide back, not jump"
+
+
+def test_silence_holds_adaptive_values(engine):
+    engine.set_adaptive_enabled(True)
+    run_analysis(engine, music(15))
+    held = dict(engine.adaptive_values)
+    run_analysis(engine, np.zeros((SR * 5, 8), dtype=np.float32))
+    assert engine.adaptive_values == held
+
+
+def test_adaptive_switch_is_saved_but_live_values_are_not(engine, tmp_path):
+    engine.clarity_amount = 3.3
+    engine.set_adaptive_enabled(True)
+    run_analysis(engine, music(15))
+    engine.save_config()
+    data = json.loads((tmp_path / "config.json").read_text())
+    assert data["adaptive_enabled"] is True
+    assert data["speakers"]["clarity_amount"] == 3.3
+    assert "adaptive_mode" not in data and "adaptive_profile" not in data
+
+
+def test_effects_use_the_live_adaptive_value(engine):
+    engine.virtual_room = True
+    x = noise(480, 2)
+    engine.virtual_room_mix = 0.0
+    a = x.copy(); engine._apply_virtual_room(a)
+    np.testing.assert_allclose(a, x, atol=1e-7)          # manual mix 0 -> dry
+    engine.set_adaptive_enabled(True)
+    engine.adaptive_values = {"virtual_room_mix": 0.3}
+    engine._room_delay_buf = None
+    b = noise(480, 2, seed=1); ref = b.copy()
+    engine._apply_virtual_room(b)
+    engine._apply_virtual_room(b)
+    assert np.max(np.abs(b - ref)) > 1e-3                 # adaptive mix 0.3 -> reflections

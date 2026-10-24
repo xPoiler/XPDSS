@@ -53,32 +53,14 @@ def test_apply_profile_to_object_restores_defaults_for_missing_fields():
     assert state.dialogue_focus == PROFILE_DEFAULTS["dialogue_focus"]
 
 
-def test_adaptive_state_round_trip_keeps_mode_profile_and_compare_flags():
-    state = make_state(
-        adaptive_mode="full",
-        adaptive_profile="cinema",
-        adaptive_compare_bypass=True,
-        adaptive_monitor_enabled=False,
-        adaptive_observe_only=False,
-    )
-
-    adaptive_state = build_adaptive_state_from_object(state)
-
-    assert adaptive_state == {
-        "adaptive_monitor_enabled": False,
-        "adaptive_observe_only": False,
-        "adaptive_mode": "full",
-        "adaptive_profile": "cinema",
-        "adaptive_compare_bypass": True,
-    }
+def test_adaptive_state_is_a_single_switch_and_ignores_old_keys():
+    state = make_state(adaptive_enabled=True)
+    assert build_adaptive_state_from_object(state) == {"adaptive_enabled": True}
 
     target = make_state()
-    apply_adaptive_state_to_object(target, {"adaptive_mode": "assist", "adaptive_profile": "night"})
-
-    assert target.adaptive_mode == "assist"
-    assert target.adaptive_profile == "night"
-    assert target.adaptive_compare_bypass == ADAPTIVE_DEFAULTS["adaptive_compare_bypass"]
-    assert target.adaptive_monitor_enabled == ADAPTIVE_DEFAULTS["adaptive_monitor_enabled"]
+    apply_adaptive_state_to_object(target, {"adaptive_mode": "full", "adaptive_profile": "night"})
+    assert target.adaptive_enabled == ADAPTIVE_DEFAULTS["adaptive_enabled"]
+    assert not hasattr(target, "adaptive_profile")
 
 
 def test_secondary_output_state_round_trip_keeps_device_and_filter_controls():
