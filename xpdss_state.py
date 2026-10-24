@@ -75,6 +75,18 @@ SECONDARY_OUTPUT_DEFAULTS: Dict[str, Any] = {
 }
 
 
+def _merge_known(defaults: Dict[str, Any], values: Dict[str, Any] | None) -> Dict[str, Any]:
+    """Defaults overlaid with `values`, ignoring keys that are not settings.
+
+    Config files (especially old flat ones) can contain unrelated keys; they
+    must never be written onto the audio engine as attributes.
+    """
+    data = dict(defaults)
+    if values:
+        data.update({key: value for key, value in values.items() if key in defaults})
+    return data
+
+
 def build_profile_from_object(obj: Any) -> Dict[str, Any]:
     profile: Dict[str, Any] = {}
     for key, default in PROFILE_DEFAULTS.items():
@@ -88,9 +100,7 @@ def build_profile_from_object(obj: Any) -> Dict[str, Any]:
 
 
 def apply_profile_to_object(obj: Any, profile: Dict[str, Any] | None) -> Dict[str, Any]:
-    data = dict(PROFILE_DEFAULTS)
-    if profile:
-        data.update(profile)
+    data = _merge_known(PROFILE_DEFAULTS, profile)
 
     for key, value in data.items():
         attr_name = key
@@ -110,9 +120,7 @@ def build_adaptive_state_from_object(obj: Any) -> Dict[str, Any]:
 
 
 def apply_adaptive_state_to_object(obj: Any, state: Dict[str, Any] | None) -> Dict[str, Any]:
-    data = dict(ADAPTIVE_DEFAULTS)
-    if state:
-        data.update(state)
+    data = _merge_known(ADAPTIVE_DEFAULTS, state)
 
     for key, value in data.items():
         setattr(obj, key, value)
@@ -127,9 +135,7 @@ def build_secondary_output_state_from_object(obj: Any) -> Dict[str, Any]:
 
 
 def apply_secondary_output_state_to_object(obj: Any, state: Dict[str, Any] | None) -> Dict[str, Any]:
-    data = dict(SECONDARY_OUTPUT_DEFAULTS)
-    if state:
-        data.update(state)
+    data = _merge_known(SECONDARY_OUTPUT_DEFAULTS, state)
 
     for key, value in data.items():
         setattr(obj, key, value)

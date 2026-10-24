@@ -40,7 +40,8 @@ class HeadTracker:
         
         self.smoothing = 0.35 # Faster responsiveness
         self._valid_frames = 0
-        
+        self._miss_count = 0
+
         self.running = False
         self.show_preview = False
         self._window_visible = False
@@ -58,13 +59,23 @@ class HeadTracker:
     def stop(self):
         self.running = False
         if self.thread:
-            self.thread.join(timeout=2.0)
-        if hasattr(self, 'detector'):
+            self.thread.join(timeout=3.0)
+            if self.thread.is_alive():
+                # The worker still owns the detector (e.g. blocked in a camera
+                # read); it closes it itself when the loop exits.
+                print("HeadTracker: Stopping (worker still finishing)")
+                return
+        self._close_detector()
+        print("HeadTracker: Stopped")
+
+    def _close_detector(self):
+        detector = getattr(self, 'detector', None)
+        self.detector = None
+        if detector is not None:
             try:
-                self.detector.close()
+                detector.close()
             except Exception:
                 pass
-        print("HeadTracker: Stopped")
             
     def _worker(self):
         last_time = time.time()
@@ -73,7 +84,6 @@ class HeadTracker:
         max_failures = 30 # At 30fps, ~1 second of failure before reconnecting
         
         while self.running:
-            raw_yaw = 0.0 # reset for this frame
             if cap is None or not cap.isOpened():
                 if cap is not None:
                     cap.release()
@@ -123,6 +133,8 @@ class HeadTracker:
             rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_image)
             
+            if self.detector is None:
+                break
             try:
                 detection_result = self.detector.detect(mp_image)
             except Exception as e:
@@ -130,98 +142,77 @@ class HeadTracker:
                 time.sleep(0.1)
                 continue
             
-            # --- Extract Rotation ---
-            if hasattr(detection_result, 'facial_transformation_matrixes') and detection_result.facial_transformation_matrixes:
-                try:
-                    m = detection_result.facial_transformation_matrixes[0]
-                    arr = np.array(m.data).reshape(4, 4)
-                    raw_yaw = np.arctan2(arr[0, 2], arr[0, 0])
-                    yaw_speed = np.abs(raw_yaw - self.rot_yaw)
-                    alpha_yaw = min(0.90, self.smoothing + max(0.0, 0.20 - yaw_speed * 10.0))
-                    self.rot_yaw = self.rot_yaw * alpha_yaw + raw_yaw * (1 - alpha_yaw)
-                except Exception:
-                    pass
-
             if detection_result.face_landmarks:
-                sum_x, sum_y, sum_z = 0.0, 0.0, 0.0
-                valid_count = 0
-                valid_coords = [] # Deduplicate overlapping face bounding boxes
-                
-                h, w, c = image.shape
-                valid_frames = getattr(self, '_valid_frames', 0)
-                
-                for landmarks in detection_result.face_landmarks:
+                h, w, _ = image.shape
+                valid_frames = self._valid_frames
+
+                # Pick ONE face to follow: the one closest to the previously
+                # tracked position (or the largest/closest face when no lock).
+                # Averaging several people moved the sweet spot between them.
+                best = None
+                for idx, landmarks in enumerate(detection_result.face_landmarks):
                     nose = landmarks[4]
                     eye_l = landmarks[33]
                     eye_r = landmarks[263]
-                    
+
                     # Absolute Pixels based scaling
-                    dx = (eye_r.x - eye_l.x) * w 
-                    dy = (eye_r.y - eye_l.y) * h 
-                    
-                    cosine_yaw = np.cos(getattr(self, 'rot_yaw', 0.0))
-                    cosine_yaw = max(0.4, abs(cosine_yaw))
+                    dx = (eye_r.x - eye_l.x) * w
+                    dy = (eye_r.y - eye_l.y) * h
+
+                    cosine_yaw = max(0.4, abs(np.cos(self.rot_yaw)))
                     corrected_dx = dx / cosine_yaw
-                    
-                    eye_dist_px = np.sqrt(corrected_dx**2 + dy**2)
-                    eye_dist = eye_dist_px / w # Normalized to full frame width
-                    
-                    # 1. Size Gating: Reject absolute tiny faces 
-                    if eye_dist < 0.012: 
+
+                    eye_dist = np.sqrt(corrected_dx**2 + dy**2) / w # Normalized to full frame width
+
+                    # 1. Size Gating: Reject absolute tiny faces
+                    if eye_dist < 0.012:
                         continue
-                        
-                    raw_z = 0.17 / (eye_dist + 1e-6)
-                    
+
                     raw_x = nose.x - 0.5
                     raw_y = nose.y - 0.5
-                    
-                    # 2. Spatial gating: Reject if too far from last valid position (background clutter)
                     dist_to_last = np.sqrt((raw_x - self.pos_x)**2 + (raw_y - self.pos_y)**2)
+
+                    # 2. Spatial gating: Reject small faces far from the lock (background clutter)
                     if valid_frames > 8 and dist_to_last > 0.45 and eye_dist < 0.045:
-                        continue # Skip false face in background
-                        
-                    # 3. Overlap Deduplication: Reject if 2 faces occupy same space (sensitivity duplicate)
-                    is_dup = False
-                    for (vx, vy) in valid_coords:
-                        if np.sqrt((raw_x - vx)**2 + (raw_y - vy)**2) < 0.15:
-                            is_dup = True
-                            break
-                    if is_dup:
-                        continue # Skip duplicate
-                        
-                    sum_x += raw_x
-                    sum_y += raw_y
-                    sum_z += raw_z
-                    valid_coords.append((raw_x, raw_y))
-                    valid_count += 1
-                    
-                    for node in [nose, eye_l, eye_r]:
-                        px = int(node.x * w)
-                        py = int(node.y * h) 
-                        cv2.circle(image, (px, py), 4, (0, 0, 255), -1)
-                        
-                if valid_count > 0:
-                    avg_x = sum_x / valid_count
-                    avg_y = sum_y / valid_count
-                    avg_z = sum_z / valid_count
-                    self._valid_frames = valid_frames + 1
-                    setattr(self, '_miss_count', 0)
-                else:
+                        continue
+
+                    score = dist_to_last if valid_frames > 8 else -eye_dist
+                    if best is None or score < best[0]:
+                        best = (score, idx, raw_x, raw_y, 0.17 / (eye_dist + 1e-6), (nose, eye_l, eye_r))
+
+                if best is None:
                     self._valid_frames = max(0, valid_frames - 1)
-                    miss_count = getattr(self, '_miss_count', 0) + 1
-                    setattr(self, '_miss_count', miss_count)
-                    if miss_count > 6: # Unlock spatial gate if consecutive skips exceed 0.2s
+                    self._miss_count += 1
+                    if self._miss_count > 6: # Unlock spatial gate if consecutive skips exceed 0.2s
                         self._valid_frames = 0
-                    continue # Skip update for this frame group if everything filtered
-                
-                # Adaptive smoothing for lock and fast response
-                speed = np.sqrt((avg_x - self.pos_x)**2 + (avg_y - self.pos_y)**2)
-                alpha_dyn = min(0.92, self.smoothing + max(0.0, 0.22 - speed * 10.0))
-                
-                self.pos_x = self.pos_x * alpha_dyn + avg_x * (1 - alpha_dyn)
-                self.pos_y = self.pos_y * alpha_dyn + avg_y * (1 - alpha_dyn)
-                self.pos_z = self.pos_z * alpha_dyn + avg_z * (1 - alpha_dyn)
-                    
+                else:
+                    _, face_idx, avg_x, avg_y, avg_z, nodes = best
+                    self._valid_frames = valid_frames + 1
+                    self._miss_count = 0
+
+                    for node in nodes:
+                        cv2.circle(image, (int(node.x * w), int(node.y * h)), 4, (0, 0, 255), -1)
+
+                    # --- Rotation of the SAME face ---
+                    matrices = getattr(detection_result, 'facial_transformation_matrixes', None)
+                    if matrices and face_idx < len(matrices):
+                        try:
+                            arr = np.array(matrices[face_idx].data).reshape(4, 4)
+                            raw_yaw = np.arctan2(arr[0, 2], arr[0, 0])
+                            yaw_speed = np.abs(raw_yaw - self.rot_yaw)
+                            alpha_yaw = min(0.90, self.smoothing + max(0.0, 0.20 - yaw_speed * 10.0))
+                            self.rot_yaw = self.rot_yaw * alpha_yaw + raw_yaw * (1 - alpha_yaw)
+                        except Exception:
+                            pass
+
+                    # Adaptive smoothing for lock and fast response
+                    speed = np.sqrt((avg_x - self.pos_x)**2 + (avg_y - self.pos_y)**2)
+                    alpha_dyn = min(0.92, self.smoothing + max(0.0, 0.22 - speed * 10.0))
+
+                    self.pos_x = self.pos_x * alpha_dyn + avg_x * (1 - alpha_dyn)
+                    self.pos_y = self.pos_y * alpha_dyn + avg_y * (1 - alpha_dyn)
+                    self.pos_z = self.pos_z * alpha_dyn + avg_z * (1 - alpha_dyn)
+
             if self.show_preview:
                 cv2.imshow("XTC 3D Head Tracker", image)
                 self._window_visible = True
@@ -257,8 +248,9 @@ class HeadTracker:
 
         try:
             cv2.destroyAllWindows()
-        except:
+        except Exception:
             pass
+        self._close_detector()
 
 if __name__ == "__main__":
     import argparse

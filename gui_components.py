@@ -3,7 +3,7 @@ import math
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QSlider, QLabel, QFrame, QGridLayout, QPushButton,
                              QMessageBox, QProgressDialog, QTabWidget, QScrollArea)
-from PySide6.QtCore import Qt, QPointF, Signal, QTimer, QRectF, QThread
+from PySide6.QtCore import Qt, QPointF, Signal, Slot, QTimer, QRectF, QThread
 import sounddevice as sd
 from PySide6.QtGui import QPainter, QColor, QBrush, QPen, QRadialGradient, QFont
 from PySide6.QtMultimedia import QMediaDevices
@@ -49,7 +49,7 @@ class CalibrationDialog(QDialog):
              devices = sd.query_devices()
              try:
                  default_input = sd.default.device[0]
-             except:
+             except Exception:
                  default_input = -1
 
              for i, d in enumerate(devices):
@@ -170,6 +170,16 @@ class HaloPanningWidget(QFrame):
                 rad = math.radians(angle)
                 lx = cx + label_dist * math.cos(rad)
                 ly = cy + label_dist * math.sin(rad)
+
+                # Level halo from the analysis peaks (0 dBFS -> full halo)
+                peak = self.last_peaks[ch_idx] if ch_idx < len(self.last_peaks) else 0.0
+                if is_enabled and peak > 0.001:
+                    level = max(0.0, min(1.0, 1.0 + 20.0 * math.log10(peak) / 60.0))
+                    halo = QColor(active_color)
+                    halo.setAlpha(int(60 + 140 * level))
+                    painter.setBrush(Qt.NoBrush)
+                    painter.setPen(QPen(halo, 3))
+                    painter.drawEllipse(QPointF(lx, ly), 17 + 8 * level, 17 + 8 * level)
 
                 painter.setBrush(active_color)
                 painter.setPen(Qt.NoPen)
@@ -297,8 +307,15 @@ class UpmixerWindow(QMainWindow):
     def __init__(self, audio_app):
         super().__init__()
         self.audio_app = audio_app
+
+        # Settings are saved shortly after the last change (slider drags and
+        # radar moves used to rewrite config.json on every tick).
+        self._save_timer = QTimer(self)
+        self._save_timer.setSingleShot(True)
+        self._save_timer.setInterval(500)
+        self._save_timer.timeout.connect(self.audio_app.save_config)
+
         self.audio_app.gui_window = self
-        self.audio_app.gain = 1.0
 
         self.setWindowTitle("XPDSS PRO - Audio Analyzer")
         self.setMinimumSize(700, 550)
@@ -390,7 +407,7 @@ class UpmixerWindow(QMainWindow):
         self.btn_master.setCheckable(True)
         self.btn_master.setChecked(audio_app.upmix_enabled)
         self.btn_master.setStyleSheet(btn_style.replace("#222", "#333"))
-        self.btn_master.toggled.connect(lambda chk: (setattr(self.audio_app, "upmix_enabled", chk), self.audio_app.save_config()))
+        self.btn_master.toggled.connect(lambda chk: (setattr(self.audio_app, "upmix_enabled", chk), self.request_save()))
         right_panel.addWidget(self.btn_master)
 
         self.btn_ind = QPushButton("INDEPENDENT PANNING")
@@ -518,75 +535,75 @@ class UpmixerWindow(QMainWindow):
         right_panel.addWidget(_make_section_label("PARAMETERS"))
 
         self.sld_spread = LabeledSlider("Center Spread", 0.0, 100.0, audio_app.center_spread * 100.0, suffix="%", is_int=True)
-        self.sld_spread.valueChanged.connect(lambda v: (setattr(self.audio_app, "center_spread", v / 100.0), self.audio_app.save_config()))
+        self.sld_spread.valueChanged.connect(lambda v: (setattr(self.audio_app, "center_spread", v / 100.0), self.request_save()))
         right_panel.addWidget(self.sld_spread)
 
         self.sld_side_gain = LabeledSlider("Side Gain", -6.0, 6.0, audio_app.side_gain_db, suffix=" dB")
-        self.sld_side_gain.valueChanged.connect(lambda v: (setattr(self.audio_app, "side_gain_db", v), self.audio_app.save_config()))
+        self.sld_side_gain.valueChanged.connect(lambda v: (setattr(self.audio_app, "side_gain_db", v), self.request_save()))
         right_panel.addWidget(self.sld_side_gain)
 
         self.sld_width = LabeledSlider("Width Factor", 0.5, 2.0, audio_app.width_factor, suffix="x")
-        self.sld_width.valueChanged.connect(lambda v: (setattr(self.audio_app, "width_factor", v), self.audio_app.save_config()))
+        self.sld_width.valueChanged.connect(lambda v: (setattr(self.audio_app, "width_factor", v), self.request_save()))
         right_panel.addWidget(self.sld_width)
 
         self.sld_sub_gain = LabeledSlider("Sub Gain", 0.0, 5.0, audio_app.sub_gain, suffix="x")
-        self.sld_sub_gain.valueChanged.connect(lambda v: (setattr(self.audio_app, "sub_gain", v), self.audio_app.save_config()))
+        self.sld_sub_gain.valueChanged.connect(lambda v: (setattr(self.audio_app, "sub_gain", v), self.request_save()))
         right_panel.addWidget(self.sld_sub_gain)
 
         self.sld_sub_low = LabeledSlider("Sub Low Cutoff", 15.0, 60.0, getattr(audio_app, 'sub_low_cutoff', 20.0), suffix=" Hz")
-        self.sld_sub_low.valueChanged.connect(lambda v: (setattr(self.audio_app, "sub_low_cutoff", v), self.audio_app.save_config()))
+        self.sld_sub_low.valueChanged.connect(lambda v: (setattr(self.audio_app, "sub_low_cutoff", v), self.request_save()))
         right_panel.addWidget(self.sld_sub_low)
 
         self.sld_sub_cutoff = LabeledSlider("Sub High Cutoff", 45.0, 200.0, getattr(audio_app, 'sub_drive_cutoff', 80.0), suffix=" Hz")
-        self.sld_sub_cutoff.valueChanged.connect(lambda v: (setattr(self.audio_app, "sub_drive_cutoff", v), self.audio_app.save_config()))
+        self.sld_sub_cutoff.valueChanged.connect(lambda v: (setattr(self.audio_app, "sub_drive_cutoff", v), self.request_save()))
         right_panel.addWidget(self.sld_sub_cutoff)
 
         self.sld_transient = LabeledSlider("Transient Boost", 1.0, 12.0, getattr(audio_app, 'transient_amount', 4.0), suffix=" dB")
-        self.sld_transient.valueChanged.connect(lambda v: (setattr(self.audio_app, "transient_amount", v), self.audio_app.save_config()))
+        self.sld_transient.valueChanged.connect(lambda v: (setattr(self.audio_app, "transient_amount", v), self.request_save()))
         right_panel.addWidget(self.sld_transient)
 
         self.sld_micro_dyn = LabeledSlider("Micro-Dyn Uplift", 1.0, 12.0, getattr(audio_app, 'micro_dyn_amount', 4.0), suffix=" dB")
-        self.sld_micro_dyn.valueChanged.connect(lambda v: (setattr(self.audio_app, "micro_dyn_amount", v), self.audio_app.save_config()))
+        self.sld_micro_dyn.valueChanged.connect(lambda v: (setattr(self.audio_app, "micro_dyn_amount", v), self.request_save()))
         right_panel.addWidget(self.sld_micro_dyn)
 
         self.sld_clarity = LabeledSlider("Clarity Atten.", 1.0, 6.0, getattr(audio_app, 'clarity_amount', 4.0), suffix=" dB")
-        self.sld_clarity.valueChanged.connect(lambda v: (setattr(self.audio_app, "clarity_amount", v), self.audio_app.save_config()))
+        self.sld_clarity.valueChanged.connect(lambda v: (setattr(self.audio_app, "clarity_amount", v), self.request_save()))
         right_panel.addWidget(self.sld_clarity)
 
         self.sld_room_mix = LabeledSlider("Room Mix", 0.0, 100.0, getattr(audio_app, 'virtual_room_mix', 0.25) * 100.0, suffix="%", is_int=True)
-        self.sld_room_mix.valueChanged.connect(lambda v: (setattr(self.audio_app, "virtual_room_mix", v / 100.0), self.audio_app.save_config()))
+        self.sld_room_mix.valueChanged.connect(lambda v: (setattr(self.audio_app, "virtual_room_mix", v / 100.0), self.request_save()))
         right_panel.addWidget(self.sld_room_mix)
 
         self.sld_air = LabeledSlider("Air Gain", 0.0, 100.0, getattr(audio_app, 'air_amount', 0.3) * 100.0, suffix="%", is_int=True)
-        self.sld_air.valueChanged.connect(lambda v: (setattr(self.audio_app, "air_amount", v / 100.0), self.audio_app.save_config()))
+        self.sld_air.valueChanged.connect(lambda v: (setattr(self.audio_app, "air_amount", v / 100.0), self.request_save()))
         right_panel.addWidget(self.sld_air)
 
         self.sld_trans_delay = LabeledSlider("XTC Delay", 0.0, 30.0, getattr(audio_app, 'transaural_delay', 7), suffix=" smp", is_int=True)
-        self.sld_trans_delay.valueChanged.connect(lambda v: (setattr(self.audio_app, "transaural_delay", int(v)), self.audio_app.save_config()))
+        self.sld_trans_delay.valueChanged.connect(lambda v: (setattr(self.audio_app, "transaural_delay", int(v)), self.request_save()))
         right_panel.addWidget(self.sld_trans_delay)
 
         self.sld_trans_gain = LabeledSlider("XTC Gain", 0.0, 1.25, getattr(audio_app, 'transaural_gain', 0.35), suffix="x")
-        self.sld_trans_gain.valueChanged.connect(lambda v: (setattr(self.audio_app, "transaural_gain", v), self.audio_app.save_config()))
+        self.sld_trans_gain.valueChanged.connect(lambda v: (setattr(self.audio_app, "transaural_gain", v), self.request_save()))
         right_panel.addWidget(self.sld_trans_gain)
 
         self.sld_trans_feedback = LabeledSlider("XTC Feedback", 0.0, 0.40, getattr(audio_app, 'transaural_feedback', 0.08), suffix="x")
-        self.sld_trans_feedback.valueChanged.connect(lambda v: (setattr(self.audio_app, "transaural_feedback", v), self.audio_app.save_config()))
+        self.sld_trans_feedback.valueChanged.connect(lambda v: (setattr(self.audio_app, "transaural_feedback", v), self.request_save()))
         right_panel.addWidget(self.sld_trans_feedback)
 
         self.sld_speaker_width = LabeledSlider("Speaker Width", 20.0, 150.0, getattr(audio_app, 'speaker_width_cm', 60.0), suffix=" cm")
-        self.sld_speaker_width.valueChanged.connect(lambda v: (setattr(self.audio_app, "speaker_width_cm", v), self.audio_app.save_config()))
+        self.sld_speaker_width.valueChanged.connect(lambda v: (setattr(self.audio_app, "speaker_width_cm", v), self.request_save()))
         right_panel.addWidget(self.sld_speaker_width)
 
         self.sld_camera_fov = LabeledSlider("Camera FOV", 30.0, 120.0, getattr(audio_app, 'camera_fov', 70.0), suffix="°")
-        self.sld_camera_fov.valueChanged.connect(lambda v: (setattr(self.audio_app, "camera_fov", v), self.audio_app.save_config()))
+        self.sld_camera_fov.valueChanged.connect(lambda v: (setattr(self.audio_app, "camera_fov", v), self.request_save()))
         right_panel.addWidget(self.sld_camera_fov)
 
         self.sld_speaker_dist = LabeledSlider("Baseline Distance", 30.0, 200.0, getattr(audio_app, 'speaker_distance_cm', 70.0), suffix=" cm")
-        self.sld_speaker_dist.valueChanged.connect(lambda v: (setattr(self.audio_app, "speaker_distance_cm", v), self.audio_app.save_config()))
+        self.sld_speaker_dist.valueChanged.connect(lambda v: (setattr(self.audio_app, "speaker_distance_cm", v), self.request_save()))
         right_panel.addWidget(self.sld_speaker_dist)
 
         self.sld_room_width = LabeledSlider("Room Width", 2.0, 10.0, getattr(audio_app, 'room_width_m', 4.0), suffix=" m")
-        self.sld_room_width.valueChanged.connect(lambda v: (setattr(self.audio_app, "room_width_m", v), self.audio_app.save_config()))
+        self.sld_room_width.valueChanged.connect(lambda v: (setattr(self.audio_app, "room_width_m", v), self.request_save()))
         right_panel.addWidget(self.sld_room_width)
 
         self.update_slider_states()
@@ -601,8 +618,14 @@ class UpmixerWindow(QMainWindow):
         self.btn_export.setStyleSheet(btn_style + "padding: 8px;")
         self.btn_export.clicked.connect(self.export_config)
 
+        self.btn_calibrate = QPushButton("CALIBRATE XTC")
+        self.btn_calibrate.setStyleSheet(btn_style + "padding: 8px;")
+        self.btn_calibrate.setToolTip("Measure ITD / crosstalk with binaural in-ear microphones.")
+        self.btn_calibrate.clicked.connect(self.start_calibration)
+
         config_layout.addWidget(self.btn_import)
         config_layout.addWidget(self.btn_export)
+        config_layout.addWidget(self.btn_calibrate)
         right_panel.addLayout(config_layout)
 
         right_panel.addStretch()
@@ -734,6 +757,16 @@ class UpmixerWindow(QMainWindow):
 
         self.update_slider_states()
 
+    def request_save(self):
+        self._save_timer.start()
+
+    @Slot()
+    def bring_to_front(self):
+        """Invoked (queued) from the tray thread: show and focus the window."""
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
     # ── Toggle handler factory ──────────────────────────────────────────
     def _make_toggle_handler(self, attr):
         def handler(chk):
@@ -767,36 +800,36 @@ class UpmixerWindow(QMainWindow):
                 if hasattr(self.audio_app, 'head_tracker') and self.audio_app.head_tracker:
                     self.audio_app.head_tracker.show_preview = chk
 
-            self.audio_app.save_config()
+            self.request_save()
             if hasattr(self, 'update_slider_states'):
                 self.update_slider_states()
         return handler
 
     def on_bypass_toggled(self, checked):
         setattr(self.audio_app, "bypass_all", checked)
-        self.audio_app.save_config()
+        self.request_save()
         self.update_slider_states()
 
     def toggle_independent(self, checked):
         self.audio_app.independent_panning = checked
         self.radar.set_independent_panning(checked)
-        self.audio_app.save_config()
+        self.request_save()
 
     def set_adaptive_mode(self, mode):
         self.audio_app.adaptive_mode = mode
         self.audio_app.adaptive_monitor_enabled = True
         self.audio_app.adaptive_observe_only = (mode == 'observe')
-        self.audio_app.save_config()
+        self.request_save()
         self.refresh_adaptive_ui()
 
     def set_adaptive_profile(self, profile_name):
         self.audio_app.adaptive_profile = profile_name
-        self.audio_app.save_config()
+        self.request_save()
         self.refresh_adaptive_ui()
 
     def toggle_adaptive_compare(self, checked):
         self.audio_app.adaptive_compare_bypass = checked
-        self.audio_app.save_config()
+        self.request_save()
         self.refresh_adaptive_ui()
 
     def toggle_secondary_output(self, checked):
@@ -805,19 +838,19 @@ class UpmixerWindow(QMainWindow):
 
     def toggle_secondary_mono_sum(self, checked):
         self.audio_app.secondary_output_mono_sum = checked
-        self.audio_app.save_config()
+        self.request_save()
         self.audio_app.refresh_secondary_output_stream()
         self.update_slider_states()
 
     def on_secondary_source_changed(self, _index):
         self.audio_app.secondary_output_source_mode = self.combo_secondary_source.currentData()
-        self.audio_app.save_config()
+        self.request_save()
 
     def on_secondary_slider_changed(self, attr, value):
         setattr(self.audio_app, attr, value)
         if attr in ('secondary_output_lowpass_hz', 'secondary_output_highpass_hz'):
             self.audio_app.refresh_secondary_output_filters()
-        self.audio_app.save_config()
+        self.request_save()
 
     def refresh_adaptive_ui(self):
         mode = getattr(self.audio_app, 'adaptive_mode', 'observe')
@@ -931,6 +964,7 @@ class UpmixerWindow(QMainWindow):
         if hasattr(self, 'btn_ind'): self.btn_ind.setDisabled(is_bypass)
         if hasattr(self, 'btn_import'): self.btn_import.setDisabled(is_bypass)
         if hasattr(self, 'btn_export'): self.btn_export.setDisabled(is_bypass)
+        if hasattr(self, 'btn_calibrate'): self.btn_calibrate.setDisabled(is_bypass)
         if hasattr(self, 'btn_adapt_observe'): self.btn_adapt_observe.setDisabled(is_bypass)
         if hasattr(self, 'btn_adapt_assist'): self.btn_adapt_assist.setDisabled(is_bypass)
         if hasattr(self, 'btn_adapt_full'): self.btn_adapt_full.setDisabled(is_bypass)
@@ -941,7 +975,7 @@ class UpmixerWindow(QMainWindow):
                 b.setDisabled(is_bypass)
 
         all_sliders = ['sld_spread', 'sld_width', 'sld_side_gain', 'sld_sub_gain', 'sld_sub_cutoff',
-                       'sld_sub_low', 'sld_transient',
+                       'sld_sub_low', 'sld_transient', 'sld_micro_dyn', 'sld_clarity', 'sld_room_mix', 'sld_air',
                        'sld_trans_delay', 'sld_trans_gain', 'sld_trans_feedback',
                        'sld_speaker_width', 'sld_camera_fov', 'sld_speaker_dist', 'sld_room_width']
         for s_name in all_sliders:
@@ -1114,7 +1148,7 @@ class UpmixerWindow(QMainWindow):
 
                 self.audio_app.webcam_name = cam_name
                 self.audio_app.webcam_index = cam_idx
-                self.audio_app.save_config()
+                self.request_save()
 
                 if hasattr(self.audio_app, 'head_tracker') and self.audio_app.head_tracker:
                      self.audio_app.stop_head_tracker()
@@ -1132,7 +1166,7 @@ class UpmixerWindow(QMainWindow):
     def on_panning_changed(self, x, y):
         self.audio_app.gui_panning_x = x
         self.audio_app.gui_panning_y = y
-        self.audio_app.save_config()
+        self.request_save()
 
     def import_config(self):
         from PySide6.QtWidgets import QFileDialog
@@ -1205,12 +1239,14 @@ class UpmixerWindow(QMainWindow):
         if not isinstance(selected_device, int):
             return
 
-        progress = QProgressDialog("Initializing calibration...", "Cancel", 0, 0, self)
+        # No cancel button: the measurement cannot be interrupted safely mid-sweep
+        progress = QProgressDialog("Initializing calibration...", None, 0, 0, self)
         progress.setWindowTitle("Calibrating...")
         progress.setWindowModality(Qt.WindowModal)
         progress.show()
 
         worker = CalibrationWorker(self.audio_app, input_device_id=selected_device)
+        self._calibration_worker = worker  # keep a reference while it runs
 
         def _update_progress(text):
             progress.setLabelText(text)
@@ -1228,6 +1264,7 @@ class UpmixerWindow(QMainWindow):
                      self.option_buttons['transaural_widening'].setChecked(True)
             else:
                  QMessageBox.critical(self, "Calibration Failed", f"An error occurred:\n{message}")
+            self._calibration_worker = None
             worker.deleteLater()
 
         worker.progress_signal.connect(_update_progress)
@@ -1235,11 +1272,22 @@ class UpmixerWindow(QMainWindow):
         worker.start()
 
     def closeEvent(self, event):
+        if self._save_timer.isActive():
+            self._save_timer.stop()
+            self.audio_app.save_config()
+        if getattr(self.audio_app, 'tray_icon', None) is None:
+            # No tray icon to bring the window back: closing means quitting
+            event.ignore()
+            self.audio_app.stop()
+            return
+        # Keep running in the tray
         event.ignore()
         self.hide()
 
 def launch_gui(audio_app):
-    app = QApplication(sys.argv)
+    app = QApplication.instance() or QApplication(sys.argv)
+    # The window hides on close (tray keeps running); quitting is explicit
+    app.setQuitOnLastWindowClosed(False)
     window = UpmixerWindow(audio_app)
     window.show()
     return app.exec()

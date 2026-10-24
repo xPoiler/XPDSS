@@ -5,6 +5,8 @@ from typing import Dict
 
 
 def _clip01(value: float) -> float:
+    if value != value:  # NaN
+        return 0.0
     if value < 0.0:
         return 0.0
     if value > 1.0:
@@ -116,14 +118,27 @@ class AdaptiveController:
             air_amount=air_amount,
             micro_dyn_amount=micro_dyn_amount,
             transient_amount=transient_amount,
-            dialogue_focus=dialogue >= 0.52,
-            vocal_lock=dialogue >= 0.74 and output_mode == "speakers",
-            hp_externalization=output_mode == "headphones" and immersion >= 0.45,
+            dialogue_focus=self._hysteresis("dialogue_focus", dialogue, on=0.56, off=0.48),
+            vocal_lock=output_mode == "speakers" and self._hysteresis("vocal_lock", dialogue, on=0.78, off=0.70),
+            hp_externalization=output_mode == "headphones" and self._hysteresis("hp_externalization", immersion, on=0.50, off=0.40),
         )
 
         raw_state = AdaptiveState(targets=targets, scores=scores, output_mode=output_mode, profile=profile)
         self._state = self._smooth_state(raw_state)
         return self._state
+
+    def _hysteresis(self, key: str, value: float, on: float, off: float) -> bool:
+        """Switch on above `on`, off below `off`; hold the previous state in between.
+
+        Without a dead band the boolean targets flickered on content sitting
+        near a single threshold, toggling DSP stages block after block.
+        """
+        previous = bool(getattr(self._state.targets, key)) if self._state is not None else False
+        if value >= on:
+            return True
+        if value < off:
+            return False
+        return previous
 
     def latest_state(self) -> AdaptiveState | None:
         return self._state

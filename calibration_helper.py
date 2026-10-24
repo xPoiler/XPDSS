@@ -1,7 +1,4 @@
 import numpy as np
-import sounddevice as sd
-import time
-from scipy.signal import lfilter
 
 
 def generate_log_sweep(duration=3.0, sample_rate=48000, f1=20.0, f2=20000.0):
@@ -32,7 +29,7 @@ def deconvolve(recorded, played, eps=1e-5):
     Recovers the Impulse Response (h) using regularized division in the frequency domain.
     h = ifft( R(f) / S(f) )
     """
-    N_total = len(played) * 2 # Zero-pad to avoid cyclic convolution wrap
+    N_total = (len(played) + len(recorded)) # Zero-pad to avoid cyclic convolution wrap
     
     R = np.fft.rfft(recorded, n=N_total)
     S = np.fft.rfft(played, n=N_total)
@@ -47,15 +44,21 @@ def deconvolve(recorded, played, eps=1e-5):
     return h[:len(played)] # Return back to original duration size
 
 
-def measure_speaker(output_device_id, input_device_id, sample_rate, speaker_index, max_out_ch, max_in_ch, duration=3.0):
+def measure_speaker(output_device_id, input_device_id, sample_rate, speaker_index, max_out_ch, max_in_ch, duration=3.0, tail=0.5):
     """
     Plays a log-sweep out of speaker_index and records from input_device_id.
+
+    `tail` seconds of silence follow the sweep so the end of the sweep still
+    gets recorded despite device round-trip latency and acoustic delay.
     """
+    import sounddevice as sd
+
     sweep = generate_log_sweep(duration, sample_rate)
-    
-    # Create multi-channel output buffer
-    out_buf = np.zeros((len(sweep), max_out_ch), dtype=np.float32)
-    out_buf[:, speaker_index] = sweep # Play only on one speaker
+    total = len(sweep) + int(tail * sample_rate)
+
+    # Create multi-channel output buffer (sweep + silent tail)
+    out_buf = np.zeros((total, max_out_ch), dtype=np.float32)
+    out_buf[:len(sweep), speaker_index] = sweep # Play only on one speaker
     
     recorded_data = []
     
@@ -87,17 +90,17 @@ def measure_speaker(output_device_id, input_device_id, sample_rate, speaker_inde
     )
     
     with stream:
-        while callback.ptr < len(sweep) - 1024:
-            sd.sleep(100)
-            
-    # Concatenate the recorded buffers
+        while callback.ptr < total:
+            sd.sleep(50)
+
+    # Concatenate the recorded buffers (sweep + tail)
     recorded = np.concatenate(recorded_data, axis=0)
-    recorded = recorded[:len(sweep)] # Truncate to match exact played length
-    
+    recorded = recorded[:total]
+
     return recorded, sweep
 
 
-def calculate_transaural_params(L_FL, R_FL, L_FR, R_FR, sweep):
+def calculate_transaural_params(L_FL, R_FL, L_FR, R_FR, sweep, sample_rate=48000):
     """
     Analyzes Left/Right Ear data from sequential measurements.
     
@@ -112,8 +115,8 @@ def calculate_transaural_params(L_FL, R_FL, L_FR, R_FR, sweep):
     h_R_FR = deconvolve(R_FR, sweep)
     
     # 2. Find exact peak arrival within plausible direct-sound window
-    search_window = int(0.15 * 48000) 
-    max_head = 40 # Max ITD samples (~0.8ms)
+    search_window = int(0.15 * sample_rate)
+    max_head = int(round(0.0008 * sample_rate)) # Max ITD (~0.8ms)
     
     # FL Speaker: Sound hits Left ear first
     peak_L_FL = np.argmax(np.abs(h_L_FL[:search_window]))
@@ -145,7 +148,7 @@ def calculate_transaural_params(L_FL, R_FL, L_FR, R_FR, sweep):
     debug_peaks = (peak_L_FL, peak_R_FL, peak_L_FR, peak_R_FR)
     
     # 3. Calculate Level Differences (ILD) via Windowed RMS of direct impulses
-    window = int(0.005 * 48000) 
+    window = int(0.005 * sample_rate)
     
     def get_rms_windowed(h, peak):
          win = h[max(0, peak - window//2) : min(len(h), peak + window//2)]
