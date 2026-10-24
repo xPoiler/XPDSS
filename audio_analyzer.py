@@ -3561,12 +3561,13 @@ class AudioBypass:
         if out_ch <= 4:
             return
         # Surround ambience: 10 ms later than the fronts (precedence keeps the
-        # image in front), optionally diffused further.
+        # image in front) and always decorrelated from them. A plain delayed
+        # copy of the front ambience comb-filters with it at the listening
+        # position (notches every 100 Hz: audible phasiness).
         haas = int(0.010 * self.sample_rate)
         sa = self._delay_block('spec_haas', np.stack((al * r_amb, ar * r_amb), axis=1), haas)
         sa_l, sa_r = sa[:, 0], sa[:, 1]
-        if getattr(self, 'surround_decorrelation', False):
-            sa_l, sa_r = self._apply_surround_decorrelation(sa_l, sa_r, bank='spectral')
+        sa_l, sa_r = self._apply_surround_decorrelation(sa_l, sa_r, bank='spectral')
         if out_ch >= 8:
             # 7.1: sides (6/7) carry most of it, backs (4/5) a later, diffused copy
             back = self._delay_block('spec_back', np.stack((sa_l, sa_r), axis=1), int(0.008 * self.sample_rate))

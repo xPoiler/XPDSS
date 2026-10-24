@@ -345,3 +345,20 @@ def test_close_notes_do_not_intermodulate():
         near |= np.abs(fr - f0) < 3
     inband = (fr > 200) & (fr < 8000)
     assert 10 * np.log10(sp[inband & ~near].sum() / sp[near].sum()) < -40
+
+
+def test_surround_ambience_is_not_a_coherent_copy_of_the_fronts(engine):
+    """A delayed coherent copy of the front ambience in the surrounds
+    comb-filters at the listening position (phasiness)."""
+    r = np.random.default_rng(2)
+    x = src8(r.standard_normal((SR * 4, 2)) * 0.05)
+    out = render(engine, x)[SR:]
+
+    def max_corr(a, b, maxlag=1500):
+        a = (a - a.mean()) / a.std()
+        b = (b - b.mean()) / b.std()
+        n = len(a) - 2 * maxlag
+        return np.max(np.abs(np.correlate(b, a[maxlag:maxlag + n], 'valid'))) / n
+
+    for front, surround in ((0, 6), (1, 7), (0, 4), (6, 4)):
+        assert max_corr(out[:, front], out[:, surround]) < 0.35, (front, surround)
