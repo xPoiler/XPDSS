@@ -2,7 +2,7 @@ import os
 import math
 from scipy.signal import lfilter, butter, sosfilt, sosfilt_zi, iirnotch
 from scipy.interpolate import CubicSpline
-from scipy.ndimage import gaussian_filter1d
+from scipy.ndimage import gaussian_filter1d, minimum_filter1d
 from scipy.signal import firwin2
 import ctypes
 import sys
@@ -1048,7 +1048,7 @@ class AudioBypass:
 
     # Lazily created DSP state that depends on sample rate, block size or channel count
     _DSP_STATE_ATTRS = (
-        '_limiter_buffer', '_limiter_gr_zi', '_limiter_req_hist', '_tilt_taps', '_tilt_hist',
+        '_limiter_buffer', '_limiter_gr_zi', '_limiter_req_hist', '_limiter_hold_hist', '_tilt_taps', '_tilt_hist',
         '_fdw_lo_sos', '_fdw_hi_sos', '_fdw_zi',
         '_ext_xfeed_sos', '_ext_delay_buf',
         '_exciter_lp_sos', '_exciter_dc_zi',
@@ -2871,6 +2871,9 @@ class AudioBypass:
         with instant attack and a 60 ms release. All main channels share one
         gain (no image shift); the LFE channel (index 3) is limited on its
         own, so a sub-channel peak never turns down dialogue and music.
+        The LFE gain is held for 25 ms (half a cycle at 20 Hz) so it never
+        follows the bass waveform (no distortion on sustained overload), then
+        released in 20 ms so following bass is not ducked (no pumping).
         Rebuilds itself when the channel count, block size or sample rate
         changes.
         """
@@ -2881,13 +2884,21 @@ class AudioBypass:
         look_ahead = max(1, int(0.0015 * self.sample_rate))
         if ch > 3:
             groups = [[c for c in range(ch) if c != 3], [3]]
+            hold_ms = [0.0, 25.0]
+            release_ms = [60.0, 20.0]
         else:
             groups = [list(range(ch))]
+            hold_ms = [0.0]
+            release_ms = [60.0]
         n_groups = len(groups)
+        holds = [2 * int(h * self.sample_rate / 2000.0) for h in hold_ms]   # even sample counts
+        max_hold = max(holds)
         if (self._limiter_buffer is None or self._limiter_buffer.shape != (look_ahead, ch)
-                or getattr(self, '_limiter_req_hist', np.zeros((0, 0))).shape != (look_ahead, n_groups)):
+                or getattr(self, '_limiter_req_hist', np.zeros((0, 0))).shape != (look_ahead, n_groups)
+                or getattr(self, '_limiter_hold_hist', np.zeros((0, 0))).shape != (max_hold, n_groups)):
             self._limiter_buffer = np.zeros((look_ahead, ch), dtype=np.float32)
             self._limiter_req_hist = np.ones((look_ahead, n_groups), dtype=np.float64)
+            self._limiter_hold_hist = np.ones((max_hold, n_groups), dtype=np.float64)
             self._limiter_gr_zi = np.zeros((1, n_groups), dtype=np.float64)
 
         combined = np.concatenate((self._limiter_buffer, block), axis=0)  # (la + n, ch)
@@ -2903,9 +2914,26 @@ class AudioBypass:
         windows = np.lib.stride_tricks.sliding_window_view(req, look_ahead + 1, axis=0)
         g_min = windows.min(axis=-1)[:n]                                          # (n, groups)
 
-        release = math.exp(-1.0 / (self.sample_rate * 0.060))
+        # Hold: each output sample also keeps the lowest gain of the last
+        # `hold` samples (per group)
+        if max_hold:
+            g_ext = np.concatenate((self._limiter_hold_hist, g_min))
+            self._limiter_hold_hist = g_ext[n:].copy()
+            for gi, h in enumerate(holds):
+                if h:
+                    # trailing min over [i - h, i] == centred min shifted by h/2 (O(n))
+                    seg = g_ext[max_hold - h:, gi]
+                    g_min[:, gi] = minimum_filter1d(seg, size=h + 1, mode='nearest')[h // 2:h // 2 + n]
+
         gr = 1.0 - g_min
-        gr_env, self._limiter_gr_zi = self._asym_env_decimated(gr, 0.0, release, self._limiter_gr_zi)
+        gr_env = np.empty_like(gr)
+        new_zi = np.empty_like(self._limiter_gr_zi)
+        for gi, rel_ms in enumerate(release_ms):
+            release = math.exp(-1.0 / (self.sample_rate * rel_ms / 1000.0))
+            env, zi = self._asym_env_decimated(gr[:, gi:gi + 1], 0.0, release, self._limiter_gr_zi[:, gi:gi + 1])
+            gr_env[:, gi:gi + 1] = env
+            new_zi[:, gi:gi + 1] = zi
+        self._limiter_gr_zi = new_zi
         group_gain = 1.0 - np.maximum(gr_env, gr)
 
         gain = np.empty((n, ch), dtype=np.float32)

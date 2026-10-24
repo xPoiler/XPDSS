@@ -389,3 +389,35 @@ def test_lfe_peaks_are_limited_without_ducking_the_mains(engine):
     la = int(0.0015 * SR)
     np.testing.assert_allclose(out[la:, 0], block[:-la, 0], atol=1e-6)   # mains untouched
     assert np.max(np.abs(out[:, 3])) <= 0.9801                            # sub limited
+
+
+def _limit_lfe(engine, sig):
+    x = np.zeros((len(sig), 8), dtype=np.float32)
+    x[:, 3] = sig
+    out = np.concatenate([engine._apply_true_peak_limiter(x[i:i + 480]) for i in range(0, len(x), 480)])[:, 3]
+    la = int(0.0015 * SR)
+    return out[la:], sig[:-la]
+
+
+def test_sub_limiter_does_not_distort_sustained_overload(engine):
+    t = np.arange(SR * 2) / SR
+    y, _ = _limit_lfe(engine, (1.8 * np.sin(2 * np.pi * 40 * t)).astype(np.float32))
+    seg = y[SR // 2:SR // 2 + SR] * np.hanning(SR)
+    sp = np.abs(np.fft.rfft(seg))
+    fr = np.fft.rfftfreq(SR, 1 / SR)
+    peak = lambda f: sp[(fr > f - 2) & (fr < f + 2)].max()
+    harmonics = np.sqrt(sum(peak(40 * k) ** 2 for k in range(2, 8)))
+    assert 20 * np.log10(harmonics / peak(40)) < -80
+    assert np.max(np.abs(y)) <= 0.9801
+
+
+def test_sub_limiter_does_not_pump(engine):
+    t = np.arange(SR * 3) / SR
+    sig = 0.45 * np.sin(2 * np.pi * 50 * t)
+    for k in range(12):                                   # kicks overloading the sub, 4 per second
+        s = int(k * 0.25 * SR)
+        sig[s:s + 2400] += 1.2 * np.sin(2 * np.pi * 55 * t[s:s + 2400])
+    y, x = _limit_lfe(engine, sig.astype(np.float32))
+    for k in range(2, 11):                                # normal bass between kicks is untouched
+        seg = slice(int(k * 0.25 * SR) + int(0.10 * SR), int(k * 0.25 * SR) + int(0.20 * SR))
+        assert np.max(np.abs(y[seg])) == pytest.approx(np.max(np.abs(x[seg])), rel=0.01)
