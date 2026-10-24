@@ -231,3 +231,73 @@ def test_engine_cpu_budget(engine):
         engine._apply_upmix(x.copy(), out_ch=8)
     per_block_ms = (time.perf_counter() - t0) / 200 * 1000
     assert per_block_ms < 3.0, per_block_ms   # 10 ms budget per block
+
+
+# ── Front/back steering (cinema / gaming) ───────────────────────────────
+
+from scipy.signal import hilbert  # noqa: E402
+
+from spectral_upmix import (BACK_L, BACK_R, SIDE_L, SIDE_R, STEER_CINEMA,  # noqa: E402
+                            STEER_GAMING, STEER_OFF)
+
+
+def phased(sig, phase_deg, left=1.0, right=1.0):
+    """Same source in L and R with a given inter-channel phase difference."""
+    analytic = hilbert(sig)
+    r = np.real(analytic * np.exp(1j * np.radians(phase_deg)))
+    return np.stack([left * sig, right * r], axis=1)
+
+
+def rear_db(out):
+    return db(out[TAIL, SIDE_L] + out[TAIL, SIDE_R] + out[TAIL, BACK_L] + out[TAIL, BACK_R])
+
+
+def test_steering_off_keeps_anti_phase_content_out_of_the_center():
+    out = run(phased(tone(700), 180), steering=STEER_OFF)
+    assert db(out[TAIL, DIRECT_C]) < db(out[TAIL, DIRECT_L]) - 40
+    assert rear_db(out) < -100
+
+
+def test_cinema_sends_anti_phase_content_to_the_surrounds():
+    for x in (phased(tone(700), 180), phased(tone(700), 180, right=0.4)):
+        out = run(x, steering=STEER_CINEMA)
+        front = max(db(out[TAIL, DIRECT_L]), db(out[TAIL, DIRECT_C]), db(out[TAIL, DIRECT_R]))
+        assert rear_db(out) > front + 30
+    out = run(phased(tone(700), 180, right=0.4), steering=STEER_CINEMA)
+    assert db(out[TAIL, SIDE_L]) > db(out[TAIL, SIDE_R]) + 3     # rear source keeps its left/right position
+
+
+def test_cinema_leaves_in_phase_content_in_front():
+    out = run(pan(tone(700), -0.4), steering=STEER_CINEMA)
+    assert rear_db(out) < -100
+    ref = run(pan(tone(700), -0.4), steering=STEER_OFF)
+    np.testing.assert_allclose(out[:, DIRECT_L], ref[:, DIRECT_L], atol=1e-9)
+
+
+def _rear_share(out):
+    p = lambda ch: np.mean(out[TAIL, ch] ** 2)
+    rear = sum(p(c) for c in (SIDE_L, SIDE_R, BACK_L, BACK_R))
+    return rear / (rear + sum(p(c) for c in (DIRECT_L, DIRECT_R, DIRECT_C)))
+
+
+def test_gaming_places_partly_rear_on_sides_and_fully_rear_on_backs():
+    full = run(phased(tone(700), 180), steering=STEER_GAMING, split_sides_backs=True)
+    part = run(phased(tone(700), 125), steering=STEER_GAMING, split_sides_backs=True)
+    assert db(full[TAIL, BACK_L]) > db(full[TAIL, SIDE_L]) + 20
+    assert db(part[TAIL, SIDE_L]) > db(part[TAIL, BACK_L]) + 6
+
+
+def test_gaming_is_more_decisive_than_cinema():
+    for deg, gaming_more_rear in ((100, False), (150, True)):
+        g = _rear_share(run(phased(tone(700), deg), steering=STEER_GAMING, split_sides_backs=True))
+        c = _rear_share(run(phased(tone(700), deg), steering=STEER_CINEMA, split_sides_backs=True))
+        assert (g > c) == gaming_more_rear, (deg, g, c)
+
+
+def test_engine_cinema_with_spectral_on_5_1(engine):
+    engine.cinema_steering = True
+    engine.current_channels = 6
+    out = render(engine, src8(phased(tone(700), 180)), out_ch=6)
+    tail = slice(2 * SR, 3 * SR)
+    assert db(out[tail, 4]) > db(out[tail, 2]) + 30
+    assert db(out[tail, 5]) > -40

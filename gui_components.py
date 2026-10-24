@@ -465,6 +465,8 @@ class UpmixerWindow(QMainWindow):
                  "Frequency-domain upmix: each source is placed across L/C/R from its own\n"
                  "position in the mix, only ambience goes to the surrounds.\n"
                  "Off = classic upmix (A/B). Adds 21 ms latency while selected.\n"
+                 "With CINEMA STEERING: opposite-phase (matrix-encoded) content becomes\n"
+                 "rear point sources; with GAMING PAN too: sharper and faster, sides vs backs on 7.1.\n"
                  "Center Spread = phantom vs. dedicated center, Width = front stage width,\n"
                  "Side Gain = surround ambience level, radar Y = ambience front/rear balance."),
                 ("STAGE EQUALIZER", "stage_equalizer", "Balance front/surround weight."),
@@ -913,8 +915,7 @@ class UpmixerWindow(QMainWindow):
         is_hp = (current_mode == 'headphones')
 
         is_spectral = getattr(app, 'spectral_upmix', False)
-        # Cinema / gaming steering belong to the classic engine only
-        is_cinema = getattr(app, 'cinema_steering', False) and not is_spectral
+        is_cinema = getattr(app, 'cinema_steering', False)
         ch = app.max_output_ch
         is_stereo = (ch <= 2)
         is_bypass = getattr(app, 'bypass_all', False)
@@ -940,7 +941,7 @@ class UpmixerWindow(QMainWindow):
                 getattr(self, s_name).setDisabled(is_bypass)
 
         if hasattr(self, 'radar'):
-            self.radar.setDisabled(is_bypass or is_cinema or is_stereo or is_hp)
+            self.radar.setDisabled(is_bypass or (is_cinema and not is_spectral) or is_stereo or is_hp)
 
         secondary_enabled = getattr(app, 'secondary_output_enabled', False)
         secondary_controls = [
@@ -958,8 +959,9 @@ class UpmixerWindow(QMainWindow):
         if is_bypass:
             return
 
-        # 2. Cinema disables manual steering sliders
-        if is_cinema:
+        # 2. Classic cinema steering replaces the manual steering sliders
+        #    (the spectral engine keeps using them alongside steering)
+        if is_cinema and not is_spectral:
             for s_name in ['sld_spread', 'sld_side_gain', 'sld_width']:
                 if hasattr(self, s_name):
                     getattr(self, s_name).setDisabled(True)
@@ -991,12 +993,10 @@ class UpmixerWindow(QMainWindow):
             if f in self.option_buttons:
                 self.option_buttons[f].setVisible(is_hp)
 
-        # Gaming requires Cinema; both only apply to the classic engine
+        # Gaming requires Cinema
         if 'gaming_panning' in self.option_buttons:
             if is_spk and not is_stereo:
                  self.option_buttons['gaming_panning'].setEnabled(is_cinema)
-        if 'cinema_steering' in self.option_buttons and is_spk and not is_stereo:
-            self.option_buttons['cinema_steering'].setEnabled(not is_spectral)
 
         # 5. Cascading slider visibility
         is_sub = getattr(app, 'sub_synth', False)

@@ -14,7 +14,7 @@ import numpy as np
 import json
 from adaptive_control import ADAPTIVE_PARAMS, AdaptiveController
 from adaptive_renderer import AdaptiveFeatureEngine
-from spectral_upmix import SpectralUpmixer
+from spectral_upmix import STEER_CINEMA, STEER_GAMING, STEER_OFF, SpectralUpmixer
 from xpdss_state import (
     apply_adaptive_state_to_object,
     apply_profile_to_object,
@@ -1833,53 +1833,22 @@ class AudioBypass:
         if bank not in self._decorr_ap_states:
             self._decorr_ap_states[bank] = {}
             for ch_tag, delays in [('L', self._decorr_delays), ('R', self._decorr_delays_R)]:
-                self._decorr_ap_states[bank][ch_tag] = [
-                    {'buf': np.zeros(d, dtype=np.float32), 'ptr': 0} for d in delays]
+                self._decorr_ap_states[bank][ch_tag] = [{} for _ in delays]
         states = self._decorr_ap_states[bank]
 
         def _process_channel(sig, ch_tag):
-            out = sig.copy()
+            # Each stage: y[n] = -g*x[n] + x[n-D] + g*y[n-D]  (Schroeder all-pass)
+            out = np.asarray(sig, dtype=np.float64)
             delays = self._decorr_delays if ch_tag == 'L' else self._decorr_delays_R
             coeffs = self._decorr_coeffs if ch_tag == 'L' else self._decorr_coeffs_R
             for i, (delay, coeff) in enumerate(zip(delays, coeffs)):
                 state = states[ch_tag][i]
-                buf = state['buf']
-                ptr = state['ptr']
-                blen = len(buf)
-                
-                num_samples = len(out)
-                result = np.empty(num_samples, dtype=np.float32)
-                
-                it = 0
-                while it < num_samples:
-                    chunk = min(blen, num_samples - it)
-                    
-                    # 1. Fetch delayed samples (ptr iterates the delay buffer of length 'delay')
-                    end_idx = min(ptr + chunk, blen)
-                    first_part = end_idx - ptr
-                    
-                    delayed = np.empty(chunk, dtype=np.float32)
-                    delayed[:first_part] = buf[ptr:end_idx]
-                    if first_part < chunk:
-                        delayed[first_part:] = buf[:chunk - first_part]
-                    
-                    # 2. Apply all-pass: result = -g*in + delayed, buf_new = in + g*result
-                    in_chunk = out[it : it + chunk]
-                    res_chunk = -coeff * in_chunk + delayed
-                    buf_update = in_chunk + coeff * res_chunk
-                    
-                    # 3. Store back into circular buffer
-                    buf[ptr:end_idx] = buf_update[:first_part]
-                    if first_part < chunk:
-                        buf[:chunk - first_part] = buf_update[first_part:]
-                    
-                    result[it : it + chunk] = res_chunk
-                    ptr = (ptr + chunk) % blen
-                    it += chunk
-                
-                state['ptr'] = ptr
-                out = result
-            return out
+                if 'zi' not in state:
+                    b_ap = np.zeros(delay + 1); b_ap[0] = -coeff; b_ap[delay] = 1.0
+                    a_ap = np.zeros(delay + 1); a_ap[0] = 1.0; a_ap[delay] = -coeff
+                    state.update(b=b_ap, a=a_ap, zi=np.zeros(delay))
+                out, state['zi'] = lfilter(state['b'], state['a'], out, zi=state['zi'])
+            return out.astype(np.float32)
 
         # Use different delay orderings for L vs R to maximize decorrelation
         out_L = _process_channel(sig_L, 'L')
@@ -2881,7 +2850,7 @@ class AudioBypass:
         if n == 0:
             return block
         threshold = 0.98
-        look_ahead = max(1, int(0.0015 * self.sample_rate))
+        look_ahead = max(2, 2 * int(0.0015 * self.sample_rate / 2))   # even
         if ch > 3:
             groups = [[c for c in range(ch) if c != 3], [3]]
             hold_ms = [0.0, 25.0]
@@ -2911,8 +2880,8 @@ class AudioBypass:
         self._limiter_req_hist = req[n:].copy()
 
         # Output sample i is combined[i]; its gain must cover samples i..i+la
-        windows = np.lib.stride_tricks.sliding_window_view(req, look_ahead + 1, axis=0)
-        g_min = windows.min(axis=-1)[:n]                                          # (n, groups)
+        # (forward min == centred min shifted by la/2, O(n))
+        g_min = minimum_filter1d(req, size=look_ahead + 1, axis=0, mode='nearest')[look_ahead // 2:look_ahead // 2 + n]
 
         # Hold: each output sample also keeps the lowest gain of the last
         # `hold` samples (per group)
@@ -2926,14 +2895,8 @@ class AudioBypass:
                     g_min[:, gi] = minimum_filter1d(seg, size=h + 1, mode='nearest')[h // 2:h // 2 + n]
 
         gr = 1.0 - g_min
-        gr_env = np.empty_like(gr)
-        new_zi = np.empty_like(self._limiter_gr_zi)
-        for gi, rel_ms in enumerate(release_ms):
-            release = math.exp(-1.0 / (self.sample_rate * rel_ms / 1000.0))
-            env, zi = self._asym_env_decimated(gr[:, gi:gi + 1], 0.0, release, self._limiter_gr_zi[:, gi:gi + 1])
-            gr_env[:, gi:gi + 1] = env
-            new_zi[:, gi:gi + 1] = zi
-        self._limiter_gr_zi = new_zi
+        release = np.exp(-1.0 / (self.sample_rate * np.asarray(release_ms) / 1000.0)).reshape(1, -1)
+        gr_env, self._limiter_gr_zi = self._asym_env_decimated(gr, 0.0, release, self._limiter_gr_zi)
         group_gain = 1.0 - np.maximum(gr_env, gr)
 
         gain = np.empty((n, ch), dtype=np.float32)
@@ -3462,7 +3425,7 @@ class AudioBypass:
         # or the one being faded out, needs it.
         spectral_modes = ('spectral', 'pass_d')
         if mode in spectral_modes or getattr(self, '_route_fade_from', None) in spectral_modes:
-            self._prepare_spectral_block(src_block)
+            self._prepare_spectral_block(src_block, out_ch)
         else:
             self._spectral_was_active = False
 
@@ -3540,7 +3503,7 @@ class AudioBypass:
         store[key] = ext[block.shape[0]:].copy()
         return ext[:block.shape[0]]
 
-    def _prepare_spectral_block(self, src_block):
+    def _prepare_spectral_block(self, src_block, out_ch=8):
         """Run the spectral analysis/resynthesis exactly once per block."""
         engine = getattr(self, '_spectral', None)
         if engine is None or engine.sample_rate != int(self.sample_rate):
@@ -3551,19 +3514,26 @@ class AudioBypass:
             self._delay_hist = {}
             self._spectral_was_active = True
         width = self.width_factor * getattr(self, '_dynamic_width_ratio', 1.0)
+        # Cinema / gaming steering: front/back placement from L/R phase
+        if getattr(self, 'cinema_steering', False):
+            steering = STEER_GAMING if getattr(self, 'gaming_panning', False) else STEER_CINEMA
+        else:
+            steering = STEER_OFF
         self._spec_streams = engine.process(
             src_block[:, :2], center_spread=self.center_spread, width=width,
-            center=self.center_extraction).astype(np.float32)
+            center=self.center_extraction, steering=steering,
+            split_sides_backs=out_ch >= 8).astype(np.float32)
         self._spec_delayed_src = self._delay_block('spec_src', src_block, engine.latency)
 
     def _route_spectral(self, out_block, out_ch):
-        """Front stage from the re-panned direct sound, ambience to the surrounds.
+        """Front stage from the re-panned direct sound, ambience (and, with
+        cinema/gaming steering, rear point sources) to the surrounds.
 
         Windows channel order: FL FR C LFE BL BR SL SR (5.1: 4/5 = surrounds).
         """
         frames = out_block.shape[0]
         streams = self._spec_streams
-        dl, dr, dc, al, ar = (streams[:, i] for i in range(5))
+        dl, dr, dc, al, ar, side_l, side_r, back_l, back_r = (streams[:, i] for i in range(9))
         d_src = self._spec_delayed_src
 
         # Ambience split front/rear by the radar's fade (constant power),
@@ -3599,14 +3569,15 @@ class AudioBypass:
         if out_ch >= 8:
             # 7.1: sides (6/7) carry most of it, backs (4/5) a later, diffused copy
             back = self._delay_block('spec_back', np.stack((sa_l, sa_r), axis=1), int(0.008 * self.sample_rate))
-            back_l, back_r = self._apply_surround_decorrelation(back[:, 0], back[:, 1], bank='spectral_back')
-            out_block[:, 6] = 0.8 * sa_l
-            out_block[:, 7] = 0.8 * sa_r
-            out_block[:, 4] = 0.6 * back_l
-            out_block[:, 5] = 0.6 * back_r
+            amb_back_l, amb_back_r = self._apply_surround_decorrelation(back[:, 0], back[:, 1], bank='spectral_back')
+            # + steered rear point sources (cinema / gaming), time-aligned
+            out_block[:, 6] = 0.8 * sa_l + side_l
+            out_block[:, 7] = 0.8 * sa_r + side_r
+            out_block[:, 4] = 0.6 * amb_back_l + back_l
+            out_block[:, 5] = 0.6 * amb_back_r + back_r
         else:
-            out_block[:, 4] = sa_l
-            out_block[:, 5] = sa_r
+            out_block[:, 4] = sa_l + side_l
+            out_block[:, 5] = sa_r + side_r
 
     def _downmix_extra_channels(self, src_block, out_block, out_ch):
         """Fold input channels the output layout lacks into the ones it has.

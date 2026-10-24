@@ -16,6 +16,17 @@ speakers from its own panning position (amplitude ratio |a|), so several
 sources at different frequencies each land at their own place in the front
 stage. Only the ambient part is meant for the surrounds.
 
+Front/back: the inter-channel phase of the direct part tells front from
+rear. In-phase content is front; content in opposite phase between L and R
+is how matrix-encoded stereo (Dolby Surround / Pro Logic) and many games
+carry rear sounds. Steering modes:
+  STEER_OFF     rear-phase content stays in L/R as a phantom (plain stereo)
+  STEER_CINEMA  rear-phase content becomes a point source in the surrounds,
+                left/right from its panning
+  STEER_GAMING  as cinema, with sharper front/back decisions and faster
+                tracking; on 7.1 partly-rear sources go to the sides and
+                fully-rear ones to the backs
+
 Streaming: frames of `fft_size` with 75 % overlap and sqrt-Hann
 analysis/synthesis windows (perfect reconstruction). Latency is exactly
 `fft_size` samples whatever the host block size.
@@ -29,13 +40,15 @@ import numpy as np
 EPS = 1e-12
 
 # Output streams of SpectralUpmixer.process
-DIRECT_L, DIRECT_R, DIRECT_C, AMBIENT_L, AMBIENT_R = range(5)
-N_STREAMS = 5
+DIRECT_L, DIRECT_R, DIRECT_C, AMBIENT_L, AMBIENT_R, SIDE_L, SIDE_R, BACK_L, BACK_R = range(9)
+N_STREAMS = 9
+
+STEER_OFF, STEER_CINEMA, STEER_GAMING = 0, 1, 2
 
 
 class SpectralUpmixer:
     def __init__(self, sample_rate: int, fft_size: int | None = None,
-                 stats_tau: float = 0.10, debias: float = 2.0,
+                 stats_tau: float = 0.10, gaming_tau: float = 0.04, debias: float = 2.0,
                  bass_lo_hz: float = 150.0, bass_hi_hz: float = 250.0):
         self.sample_rate = int(sample_rate)
         if fft_size is None:
@@ -57,11 +70,13 @@ class SpectralUpmixer:
 
         dt = self.hop / self.sample_rate
         self.alpha = 1.0 - math.exp(-dt / stats_tau)
+        self.alpha_gaming = 1.0 - math.exp(-dt / gaming_tau)
         # Short-term averages make uncorrelated (diffuse) signals look partly
         # correlated: the expected spurious |L R*|^2 of an exponential average
         # is about alpha / (2 - alpha) * |L|^2 |R|^2. Subtracting it (x `debias`)
         # keeps reverb and room sound out of the center and fronts.
-        self.debias = float(debias) * self.alpha / (2.0 - self.alpha)
+        self.debias_factor = float(debias)
+        self.debias = self.debias_factor * self.alpha / (2.0 - self.alpha)
 
         freqs = np.fft.rfftfreq(self.n, 1.0 / self.sample_rate)
         # 0 below bass_lo (bass stays untouched in L/R), 1 above bass_hi.
@@ -89,13 +104,14 @@ class SpectralUpmixer:
 
     # ── streaming ─────────────────────────────────────────────────────
     def process(self, stereo: np.ndarray, center_spread: float = 0.0, width: float = 1.0,
-                center: bool = True) -> np.ndarray:
-        """Feed (frames, 2) samples, get (frames, 5) streams delayed by `latency`.
+                center: bool = True, steering: int = STEER_OFF, split_sides_backs: bool = False) -> np.ndarray:
+        """Feed (frames, 2) samples, get (frames, N_STREAMS) streams delayed by `latency`.
 
-        Streams: direct L, direct R, direct C (front-stage re-panned direct
-        sound) and ambient L, ambient R. center_spread 0 = sources panned
-        across L/C/R, 1 = no center (direct stays a phantom image in L/R).
-        width scales the panning positions (>1 pushes sources outward).
+        Streams: direct L/R/C (front stage), ambient L/R, and the steered
+        rear point sources SIDE_L/R and BACK_L/R (zero unless steering is
+        on; BACK_* only with split_sides_backs, i.e. a 7.1 layout).
+        center_spread 0 = sources panned across L/C/R, 1 = no center (direct
+        stays a phantom image in L/R). width scales the panning positions.
         """
         frames = stereo.shape[0]
         spread = 1.0 if not center else float(np.clip(center_spread, 0.0, 1.0))
@@ -105,7 +121,7 @@ class SpectralUpmixer:
             hop_in = self._pending[:self.hop]
             self._pending = self._pending[self.hop:]
             self._frame = np.concatenate((self._frame[self.hop:], hop_in))
-            self._ola += self._process_frame(self._frame, spread, float(width))
+            self._ola += self._process_frame(self._frame, spread, float(width), int(steering), bool(split_sides_backs))
             produced.append(self._ola[:self.hop].copy())
             self._ola = np.concatenate((self._ola[self.hop:], np.zeros((self.hop, N_STREAMS))))
         if produced:
@@ -115,7 +131,8 @@ class SpectralUpmixer:
         return out
 
     # ── one STFT frame ────────────────────────────────────────────────
-    def _process_frame(self, frame: np.ndarray, spread: float, width: float) -> np.ndarray:
+    def _process_frame(self, frame: np.ndarray, spread: float, width: float,
+                       steering: int = STEER_OFF, split: bool = False) -> np.ndarray:
         X = np.fft.rfft(frame * self.win[:, None], axis=0)
         L, R = X[:, 0], X[:, 1]
 
@@ -125,20 +142,23 @@ class SpectralUpmixer:
             self._pll, self._prr, self._plr = pll_i, prr_i, plr_i
             self._primed = True
         else:
-            a = self.alpha
+            a = self.alpha_gaming if steering == STEER_GAMING else self.alpha
             self._pll = self._pll + a * (pll_i - self._pll)
             self._prr = self._prr + a * (prr_i - self._prr)
             self._plr = self._plr + a * (plr_i - self._plr)
         pll = self._smooth_bins(self._pll)
         prr = self._smooth_bins(self._prr)
         plr = self._smooth_bins(self._plr)
-        if self.debias:
+        debias = self.debias
+        if steering == STEER_GAMING:
+            debias = self.debias_factor * self.alpha_gaming / (2.0 - self.alpha_gaming)
+        if debias:
             # The spurious part vanishes for fully coherent bins, so the
             # correction scales with (1 - coherence^2)^2: mono stays mono.
             plr_mag2 = np.abs(plr) ** 2
             power = pll * prr
             coh2 = np.clip(plr_mag2 / np.maximum(power, EPS), 0.0, 1.0)
-            corrected = np.maximum(plr_mag2 - self.debias * (1.0 - coh2) ** 2 * power, 0.0)
+            corrected = np.maximum(plr_mag2 - debias * (1.0 - coh2) ** 2 * power, 0.0)
             plr = plr * np.sqrt(corrected / np.maximum(plr_mag2, EPS))
 
         # Primary-ambient decomposition, using the louder channel of each bin
@@ -182,25 +202,73 @@ class SpectralUpmixer:
         u_l = self._unit(DL)
         u_r = self._unit(DR, fallback=u_l)
         u_c = self._unit(DL + DR, fallback=u_l)
-        lcr_l = g_l * mag * u_l
-        lcr_r = g_r * mag * u_r
-        lcr_c = g_c * mag * u_c
 
-        out_l = (1.0 - spread) * lcr_l + spread * DL
-        out_r = (1.0 - spread) * lcr_r + spread * DR
+        # Front/back from the inter-channel phase of the direct part:
+        # rear = 0 for phase differences up to 90 deg, 1 at 180 deg.
+        cos_phase = np.real(plr) / np.maximum(np.abs(plr), EPS)
+        rear = np.clip(-cos_phase, 0.0, 1.0)
+        rear_raw = rear
+        if steering == STEER_GAMING:
+            rear = np.clip((rear - 0.25) / 0.5, 0.0, 1.0)  # decisive front/back
+        front = 1.0 - rear
+
+        if steering == STEER_OFF:
+            # Linear split: the rear-phase part stays exactly as it was in L/R
+            f_amp, r_amp = front, rear
+            keep_l, keep_r = rear * DL, rear * DR
+        else:
+            # Steered: constant power between the front stage and the surrounds
+            f_amp, r_amp = np.sqrt(front), np.sqrt(rear)
+            keep_l = keep_r = 0.0
+
+        lcr_l = g_l * mag * f_amp * u_l
+        lcr_r = g_r * mag * f_amp * u_r
+        lcr_c = g_c * mag * f_amp * u_c
+
+        out_l = (1.0 - spread) * lcr_l + spread * DL * f_amp + keep_l
+        out_r = (1.0 - spread) * lcr_r + spread * DR * f_amp + keep_r
         out_c = (1.0 - spread) * lcr_c
+
+        side_l = side_r = back_l = back_r = 0.0
+        if steering != STEER_OFF:
+            # Rear point source, panned left/right by its position (constant power)
+            th = (pan + 1.0) * (math.pi / 4)
+            rear_mag = mag * r_amp
+            src_l = np.cos(th) * rear_mag * u_l     # one common phase: a coherent
+            src_r = np.sin(th) * rear_mag * u_l     # rear image, not an anti-phase one
+            if split and steering == STEER_GAMING:
+                # 7.1: beside (~110-120 deg phase) -> sides, behind (180 deg) -> backs
+                behind = np.clip((rear_raw - 0.5) / 0.5, 0.0, 1.0) * (math.pi / 2)
+                g_side = np.cos(behind)
+                g_back = np.sin(behind)
+            elif split:
+                g_side, g_back = 0.8, 0.6
+            else:
+                g_side, g_back = 1.0, 0.0
+            side_l, side_r = g_side * src_l, g_side * src_r
+            back_l, back_r = g_back * src_l, g_back * src_r
 
         # Below ~150 Hz nothing is moved: bass stays in L/R as it is
         w = self.process_weight
-        streams = np.empty((self.bins, N_STREAMS), dtype=np.complex128)
+        streams = np.zeros((self.bins, N_STREAMS), dtype=np.complex128)
         streams[:, DIRECT_L] = w * out_l + (1.0 - w) * L
         streams[:, DIRECT_R] = w * out_r + (1.0 - w) * R
         streams[:, DIRECT_C] = w * out_c
         streams[:, AMBIENT_L] = w * AL
         streams[:, AMBIENT_R] = w * AR
+        streams[:, SIDE_L] = w * side_l
+        streams[:, SIDE_R] = w * side_r
+        streams[:, BACK_L] = w * back_l
+        streams[:, BACK_R] = w * back_r
 
-        y = np.fft.irfft(streams, n=self.n, axis=0)
-        return y * self.syn_win[:, None]
+        # Only synthesise the streams in use (the rear ones are silent unless
+        # steering is on; the backs only on 7.1)
+        active = list(range(AMBIENT_R + 1))
+        if steering != STEER_OFF:
+            active += [SIDE_L, SIDE_R] + ([BACK_L, BACK_R] if split else [])
+        y = np.zeros((self.n, N_STREAMS))
+        y[:, active] = np.fft.irfft(streams[:, active], n=self.n, axis=0) * self.syn_win[:, None]
+        return y
 
     @staticmethod
     def _smooth_bins(x: np.ndarray) -> np.ndarray:
