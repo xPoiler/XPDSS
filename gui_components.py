@@ -156,8 +156,9 @@ class HaloPanningWidget(QFrame):
         else:
             speaker_map = {
                 0: ("L", -135),  1: ("R", -45),   2: ("C", -90),
-                4: ("Sl", 180),  5: ("Sr", 0),
-                6: ("Bl", 135),  7: ("Br", 45)
+                # Windows 7.1 order: 4/5 = back pair, 6/7 = side pair
+                4: ("Bl", 135),  5: ("Br", 45),
+                6: ("Sl", 180),  7: ("Sr", 0)
             }
 
         painter.setFont(QFont("Inter", 10, QFont.Bold))
@@ -464,7 +465,9 @@ class UpmixerWindow(QMainWindow):
                 ("SPECTRAL UPMIX", "spectral_upmix",
                  "Frequency-domain upmix: each source is placed across L/C/R from its own\n"
                  "position in the mix, only ambience goes to the surrounds.\n"
-                 "Off = classic upmix (A/B). Adds 21 ms latency while selected.\n"
+                 "Off = classic upmix (A/B, matched in level). Adds 21 ms latency while selected.\n"
+                 "Surround ambience in both engines is delayed ~10 ms, decorrelated\n"
+                 "and mostly lateral (sides > backs on 7.1).\n"
                  "With CINEMA STEERING: opposite-phase (matrix-encoded) content becomes\n"
                  "rear point sources; with GAMING PAN too: sharper and faster, sides vs backs on 7.1.\n"
                  "Center Spread = phantom vs. dedicated center, Width = front stage width,\n"
@@ -491,14 +494,17 @@ class UpmixerWindow(QMainWindow):
                 ("FREQ-DEP WIDTH", "freq_dep_width", "Mono bass, normal mids, wide highs."),
             ]),
             ("SPATIAL AUDIO", [
-                ("TRANSAURAL XTC", "transaural_widening", "Crosstalk cancellation for wider soundstage."),
-                ("SURR DECORR", "surround_decorrelation", "All-pass diffuser for ambient separation from vocals."),
+                ("TRANSAURAL XTC", "transaural_widening", "Crosstalk cancellation for a wider stereo soundstage.\n"
+                 "Only active when no center channel is in use (it would fight the\n"
+                 "center's real phantom image); fades out automatically otherwise."),
                 ("HEAD-SHADOW EQ", "head_shadow_eq", "Angle-dependent HF occlusion model."),
                 ("3D TRACK (SPK)", "head_tracking", "Head tracking for speaker distance/delay."),
                 ("3D TRACK (HP)", "headphone_tracking", "Head tracking for headphone counter-rotation."),
                 ("HP EXTERNALIZE", "hp_externalization", "Crossfeed + reflections for out-of-head imaging."),
                 ("3D PREVIEW", "head_tracking_preview", "Show head tracking camera preview."),
-                ("VIRTUAL ROOM", "virtual_room", "Simulate early reflections of an acoustic room."),
+                ("VIRTUAL ROOM", "virtual_room", "Early reflections (4-18 ms) for spaciousness.\n"
+                 "Surround layouts: played from the sides/backs like real wall\n"
+                 "reflections, never from fronts, center or LFE. Stereo: into L/R."),
             ]),
         ]
 

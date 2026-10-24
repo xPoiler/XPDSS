@@ -287,9 +287,17 @@ def test_upmix_sends_mono_to_center_and_side_to_surrounds(engine):
     anti = upmix(engine, src8(s, -s))
     tail = slice(SR // 4, SR // 2)
     assert rms_db(mono[tail, 2]) > rms_db(mono[tail, 0]) + 20   # mono -> center
-    assert rms_db(mono[tail, 4]) < -60
+    for ch in (4, 5, 6, 7):
+        assert rms_db(mono[tail, ch]) < -60                     # mono: no surrounds
     assert rms_db(anti[tail, 2]) < -60                          # side -> no center
-    assert rms_db(anti[tail, 4]) > -20
+    assert rms_db(anti[tail, 6]) > -20                          # 7.1 sides (Windows 6/7)
+    assert rms_db(anti[tail, 6]) > rms_db(anti[tail, 4])        # backs (4/5) get less
+    # same polarity, decorrelated: for broadband side content the surround
+    # pair is neither an inverted copy (old classic: -1.00) nor a plain copy
+    n = (np.random.default_rng(7).standard_normal(SR) * 0.1).astype(np.float32)
+    wide = upmix(engine, src8(n, -n))[SR // 4:]
+    sl, sr = wide[:, 6], wide[:, 7]
+    assert abs(np.dot(sl, sr) / np.sqrt(np.dot(sl, sl) * np.dot(sr, sr))) < 0.3
 
 
 def test_center_extraction_off_folds_center_into_fronts(engine):
@@ -298,7 +306,8 @@ def test_center_extraction_off_folds_center_into_fronts(engine):
     out = upmix(engine, src8(s, s))
     tail = slice(SR // 4, SR // 2)
     assert rms_db(out[tail, 2]) < -60
-    assert rms_db(out[tail, 0]) == pytest.approx(rms_db(s[tail]) - 6.0, abs=0.5)
+    match_db = 20 * np.log10(engine.CLASSIC_MATCH_GAIN)  # classic/spectral level match
+    assert rms_db(out[tail, 0]) == pytest.approx(rms_db(s[tail]) - 6.0 + match_db, abs=0.5)
 
 
 def test_stage_equalizer_lowers_center_by_3db(engine):
@@ -330,7 +339,13 @@ def test_widening_mode_feeds_delayed_mid_to_surrounds(engine):
     out = upmix(engine, src8(x, x))
     la = int(0.0015 * SR)                           # limiter look-ahead
     delay = int(engine.widening_delay_ms * SR / 1000)
-    assert np.argmax(np.abs(out[:, 4])) == 960 + delay + la
+    haas = int(0.010 * SR)
+    arrival = 960 + delay + haas + la
+    side = out[:, 6]
+    assert np.max(np.abs(side[:arrival - 2])) < 1e-6           # nothing before the delayed arrival
+    assert np.sum(side[arrival - 2:] ** 2) > 1e-4              # ...then the diffused echo
+    # diffused: not a single coherent click (spread over several ms)
+    assert np.max(side ** 2) < 0.5 * np.sum(side ** 2)
 
 
 def test_cinema_steering_routes_by_correlation(engine):
@@ -450,7 +465,15 @@ def test_head_tracking_compensates_level_and_delay_when_off_center(engine):
     imp[SR // 2, :] = 1.0
     out = run_ht(engine, x)
     tail = slice(SR // 2, SR)
-    assert rms_db(out[tail, 0]) < rms_db(out[tail, 1]) - 1.0   # nearer speaker attenuated
+    # nearer speaker attenuated by exactly the physical 1/r ratio
+    fov = 2 * np.tan(np.radians(engine.camera_fov / 2))
+    user_x = -0.25 * engine.speaker_distance_cm * fov
+    half = engine.speaker_width_cm / 2
+    d_near = np.hypot(user_x + half, engine.speaker_distance_cm)
+    d_ref = np.hypot(half, engine.speaker_distance_cm)
+    expected = 20 * np.log10(d_near / d_ref)
+    assert rms_db(out[tail, 0]) - rms_db(x[tail, 0]) == pytest.approx(expected, abs=0.2)
+    assert abs(rms_db(out[tail, 1]) - rms_db(x[tail, 1])) < 0.2              # farther one untouched
     out_i = run_ht(engine, imp + 0)
     assert np.argmax(np.abs(out_i[:, 0])) > np.argmax(np.abs(out_i[:, 1]))  # nearer speaker delayed
 
@@ -588,3 +611,24 @@ def test_sub_level_is_consistent_between_passthrough_and_upmix(tmp_path):
         levels[name] = rms_db(out[SR:, 3])
     assert levels["passthrough"] == pytest.approx(levels["upmix"], abs=1.0)
     assert levels["spectral"] == pytest.approx(levels["upmix"], abs=1.0)
+
+
+def test_virtual_room_reflections_only_on_surrounds(engine):
+    """Reflections come from the side/back walls: fronts, center and LFE stay dry."""
+    engine.virtual_room = True
+    engine.virtual_room_mix = 1.0
+    rng = np.random.default_rng(3)
+    x = np.zeros((BLOCK * 20, 8), dtype=np.float32)
+    x[:, :3] = rng.standard_normal((x.shape[0], 3)) * 0.1
+    out = []
+    for i in range(0, x.shape[0], BLOCK):
+        b = x[i:i + BLOCK].copy()
+        engine._apply_virtual_room(b)
+        out.append(b)
+    out = np.concatenate(out)
+    assert np.array_equal(out[:, :4], x[:, :4])
+    tail = slice(BLOCK * 4, None)
+    for ch in (4, 5, 6, 7):
+        assert rms_db(out[tail, ch]) > -50  # input -20 dB, reflections ~-14..-22 dB under it
+    # sides (early reflections) louder than backs (later ones)
+    assert rms_db(out[tail, 6]) > rms_db(out[tail, 4])

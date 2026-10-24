@@ -1055,6 +1055,7 @@ class AudioBypass:
         '_sub_period_est', '_sub_need_smooth', '_sub_last_avoid',
         '_vl_voice_mask', '_dlg_bp_sos', '_dlg_bp_zi', '_air_post_zi',
         '_rs_out_pre', '_spectral', '_delay_hist', '_spectral_was_active',
+        '_bass_split_sos', '_amb_shelf_sos',
     )
 
     def _reset_dsp_state(self):
@@ -1173,8 +1174,6 @@ class AudioBypass:
         # #4 Room Boundary LP Filter (400Hz cut)
         self._boundary_lp_sos = butter(1, 400.0 / (sr / 2), btype='low', output='sos')
         
-        # #5 Air Absorption LP Filter (2000Hz cut)
-        self._absorp_lp_sos = butter(1, 2000.0 / (sr / 2), btype='low', output='sos')
 
         # Output Smooth Lowpass: 45Hz
         self._sub_out_sos = butter(2, 45.0 / (sr / 2), btype='low', output='sos')
@@ -1264,11 +1263,13 @@ class AudioBypass:
         current_base_dist = np.sqrt((S_WIDTH/2)**2 + user_z**2)
         current_base_dist_C = user_z if user_z > 0.1 else 1.0
 
-        # Aggressive Amplitude Compensation (Negative logic: Attenuate only)
-        # Never boost > 1.0 to prevent digital clipping/gain addition.
-        comp_L = min(1.0, (dist_L / current_base_dist) ** 2.5)
-        comp_R = min(1.0, (dist_R / current_base_dist) ** 2.5)
-        comp_C = min(1.0, (dist_C / current_base_dist_C) ** 2.5)
+        # Amplitude compensation, physical 1/r (attenuate only: never boost, to
+        # prevent clipping). The delay alignment below already fixes
+        # localisation; a stronger level cut (the old exponent was 2.5)
+        # pushed the image to the opposite side.
+        comp_L = min(1.0, (dist_L / current_base_dist))
+        comp_R = min(1.0, (dist_R / current_base_dist))
+        comp_C = min(1.0, (dist_C / current_base_dist_C))
 
         # ITD (Precedence Effect) Delay Compensation
         # In normal/cinema mode: FRONTS only — surrounds carry diffuse ambience
@@ -1312,16 +1313,16 @@ class AudioBypass:
         if is_gaming and not is_hp:
             if out_ch > 4:
                 # Surround base distance = R_spk (distance from sweet-spot to surround speaker)
-                comp_SL = min(1.0, (dist_SL / R_spk) ** 2.5)
-                comp_SR = min(1.0, (dist_SR / R_spk) ** 2.5)
+                comp_SL = min(1.0, (dist_SL / R_spk))
+                comp_SR = min(1.0, (dist_SR / R_spk))
                 _comp_keys += ['_ht_cs_SL','_ht_cs_SR']
                 _comp_vals += [comp_SL, comp_SR]
                 _delay_keys += ['_ht_ds_SL','_ht_ds_SR']
                 _delay_vals += [max(0.0, (max_dist - dist_SL) / cm_per_sample),
                                 max(0.0, (max_dist - dist_SR) / cm_per_sample)]
             if out_ch > 6:
-                comp_BL = min(1.0, (dist_BL / R_spk) ** 2.5)
-                comp_BR = min(1.0, (dist_BR / R_spk) ** 2.5)
+                comp_BL = min(1.0, (dist_BL / R_spk))
+                comp_BR = min(1.0, (dist_BR / R_spk))
                 _comp_keys += ['_ht_cs_BL','_ht_cs_BR']
                 _comp_vals += [comp_BL, comp_BR]
                 _delay_keys += ['_ht_ds_BL','_ht_ds_BR']
@@ -1355,17 +1356,20 @@ class AudioBypass:
         if out_ch > 2:
             out_block[:frames, 2] *= ramp_comp_C
 
+        # Windows order: 7.1 = FL FR C LFE BL BR SL SR, 5.1 surrounds on 4/5
+        side_ch = (6, 7) if out_ch >= 8 else (4, 5)
+        back_ch = (4, 5)
         if is_gaming and not is_hp:
             if out_ch > 4:
                 ramp_SL = self._get_ramp('_last_ht_comp_SL', getattr(self, '_ht_cs_SL', 1.0), frames)
                 ramp_SR = self._get_ramp('_last_ht_comp_SR', getattr(self, '_ht_cs_SR', 1.0), frames)
-                out_block[:frames, 4] *= ramp_SL
-                out_block[:frames, 5] *= ramp_SR
+                out_block[:frames, side_ch[0]] *= ramp_SL
+                out_block[:frames, side_ch[1]] *= ramp_SR
             if out_ch > 6:
                 ramp_BL = self._get_ramp('_last_ht_comp_BL', getattr(self, '_ht_cs_BL', 1.0), frames)
                 ramp_BR = self._get_ramp('_last_ht_comp_BR', getattr(self, '_ht_cs_BR', 1.0), frames)
-                out_block[:frames, 6] *= ramp_BL
-                out_block[:frames, 7] *= ramp_BR
+                out_block[:frames, back_ch[0]] *= ramp_BL
+                out_block[:frames, back_ch[1]] *= ramp_BR
                 
         # --- Head-Shadow EQ (Angle-Dependent HF Roll-Off — FRONTS only) ---
         # Surrounds are excluded: shadow EQ on diffuse ambient content creates
@@ -1407,12 +1411,10 @@ class AudioBypass:
         else:
              self._dynamic_pan_offset = 0.0
 
-        # #3 Dynamic Stereo Width Based on Subtended Angle
+        # (No distance-dependent stage width: upmixed source positions must not
+        # move when the listener does.)
         S_WIDTH = getattr(self, 'speaker_width_cm', 60.0)
         u_z = max(10.0, float(user_z)) # Avoid divide by zero
-        theta = 2 * np.arctan((S_WIDTH / 2.0) / u_z)
-        theta_base = 2 * np.arctan((S_WIDTH / 2.0) / max(10.0, float(S_DIST)))
-        self._dynamic_width_ratio = theta_base / theta
 
         if not is_hp:
             # #4 Room Boundary Compensation (Wall proximity)
@@ -1440,24 +1442,9 @@ class AudioBypass:
                 lp_R, self._bound_lp_zi_R = sosfilt(self._boundary_lp_sos, out_block[:frames, 1], zi=self._bound_lp_zi_R)
                 out_block[:frames, 1] = out_block[:frames, 1] - 0.4 * self._bound_weight_R * lp_R
 
-            # #5 Air Absorption Compensation
-            boost_factor = max(0.0, min(0.3, (u_z - 70.0) * 0.005))
-            if boost_factor > 0 and hasattr(self, '_absorp_lp_sos'):
-                # Reset stale filter state if the user just crossed the depth threshold
-                if not hasattr(self, '_abs_lp_zi_L') or getattr(self, '_last_abs_boost', 0.0) <= 0.0:
-                    self._abs_lp_zi_L = sosfilt_zi(self._absorp_lp_sos) * 0.0
-                    self._abs_lp_zi_R = sosfilt_zi(self._absorp_lp_sos) * 0.0
-                self._last_abs_boost = boost_factor
-                
-                lp_L_hf, self._abs_lp_zi_L = sosfilt(self._absorp_lp_sos, out_block[:frames, 0], zi=self._abs_lp_zi_L)
-                hp_L = out_block[:frames, 0] - lp_L_hf
-                out_block[:frames, 0] += hp_L * boost_factor
-                
-                lp_R_hf, self._abs_lp_zi_R = sosfilt(self._absorp_lp_sos, out_block[:frames, 1], zi=self._abs_lp_zi_R)
-                hp_R = out_block[:frames, 1] - lp_R_hf
-                out_block[:frames, 1] += hp_R * boost_factor
-            else:
-                self._last_abs_boost = 0.0
+            # (No air-absorption treble boost: at 1-2 m air absorption is
+            # ~0.1 dB/m even at 10 kHz, so a distance-dependent boost only
+            # changed the tonal balance.)
 
             # --- #16 Distance-Dependent Bass Compensation (front speakers) ---
             dist_ratio = user_z / max(1.0, S_DIST)
@@ -1487,11 +1474,11 @@ class AudioBypass:
             }
             if is_gaming:
                 if out_ch > 4:
-                    _delay_ch_map[4] = '_ht_ds_SL'
-                    _delay_ch_map[5] = '_ht_ds_SR'
+                    _delay_ch_map[side_ch[0]] = '_ht_ds_SL'
+                    _delay_ch_map[side_ch[1]] = '_ht_ds_SR'
                 if out_ch > 6:
-                    _delay_ch_map[6] = '_ht_ds_BL'
-                    _delay_ch_map[7] = '_ht_ds_BR'
+                    _delay_ch_map[back_ch[0]] = '_ht_ds_BL'
+                    _delay_ch_map[back_ch[1]] = '_ht_ds_BR'
             any_delay = any(getattr(self, v, 0.0) > 0.01 for ch, v in _delay_ch_map.items() if ch < out_ch)
 
             if any_delay:
@@ -1831,17 +1818,29 @@ class AudioBypass:
         states = self._decorr_ap_states[bank]
 
         def _process_channel(sig, ch_tag):
-            # Each stage: y[n] = -g*x[n] + x[n-D] + g*y[n-D]  (Schroeder all-pass)
+            # Each stage: y[n] = -g*x[n] + x[n-D] + g*y[n-D]  (Schroeder all-pass).
+            # The feedback only links samples D apart, so the recursion is D
+            # interleaved first-order filters: reshape to rows of D samples and
+            # run one first-order lfilter down the rows (O(n), no Python loop).
             out = np.asarray(sig, dtype=np.float64)
+            n = out.shape[0]
             delays = self._decorr_delays if ch_tag == 'L' else self._decorr_delays_R
             coeffs = self._decorr_coeffs if ch_tag == 'L' else self._decorr_coeffs_R
             for i, (delay, coeff) in enumerate(list(zip(delays, coeffs))[:stages]):
                 state = states[ch_tag][i]
-                if 'zi' not in state:
-                    b_ap = np.zeros(delay + 1); b_ap[0] = -coeff; b_ap[delay] = 1.0
-                    a_ap = np.zeros(delay + 1); a_ap[0] = 1.0; a_ap[delay] = -coeff
-                    state.update(b=b_ap, a=a_ap, zi=np.zeros(delay))
-                out, state['zi'] = lfilter(state['b'], state['a'], out, zi=state['zi'])
+                if 'x_hist' not in state:
+                    state['x_hist'] = np.zeros(delay)
+                    state['y_hist'] = np.zeros(delay)
+                x_ext = np.concatenate((state['x_hist'], out))
+                u = -coeff * out + x_ext[:n]
+                rows = -(-n // delay)
+                u_rows = np.zeros(rows * delay)
+                u_rows[:n] = u
+                y = lfilter([1.0], [1.0, -coeff], u_rows.reshape(rows, delay), axis=0,
+                            zi=(coeff * state['y_hist'])[None, :])[0].ravel()[:n]
+                state['x_hist'] = x_ext[-delay:].copy()
+                state['y_hist'] = np.concatenate((state['y_hist'], y))[-delay:].copy()
+                out = y
             return out.astype(np.float32)
 
         # Use different delay orderings for L vs R to maximize decorrelation
@@ -1998,66 +1997,62 @@ class AudioBypass:
                 block[:, ch] = block[:, ch] * (1.0 - self._clarity_gain_smooth) + notched_sig * self._clarity_gain_smooth
 
     def _apply_virtual_room(self, block):
-        """Virtual Room: Simulates early reflections (3-20ms) for enhanced spatiality."""
+        """Virtual Room: early reflections (4-18 ms) for spaciousness.
+
+        Real early reflections reach the listener from the side and rear walls,
+        not from the speaker that plays the direct sound. On surround layouts
+        the reflections of the front stage are therefore played from the
+        sides (early, 4.3 / 7.1 ms) and backs (later, 11.4 / 17.8 ms); nothing
+        is added to the fronts, the center or the LFE (same-speaker echoes
+        only colour the sound). On stereo outputs they go into L/R.
+        """
         if not getattr(self, 'virtual_room', False):
             return
         if not self._ensure_sos_filters('_room_lp_sos'):
             return
-            
+
         sr = self.sample_rate
         frames = block.shape[0]
         n_ch = block.shape[1]
-        
-        # 1. Initialize buffer (50ms of history + room for one block)
+        mix = self._live_param('virtual_room_mix')
+
+        # Source: the front stage (center folded in at -6 dB)
+        src = block[:, :2].astype(np.float32).copy()
+        if n_ch > 2:
+            src += 0.5 * block[:, 2:3]
+
         buf_sz = int(sr * 0.05) + frames
-        if self._room_delay_buf is None or self._room_delay_buf.shape[0] < buf_sz or self._room_delay_buf.shape[1] != n_ch:
-            self._room_delay_buf = np.zeros((buf_sz, n_ch), dtype=np.float32)
+        if self._room_delay_buf is None or self._room_delay_buf.shape[0] < buf_sz or self._room_delay_buf.shape[1] != 2:
+            self._room_delay_buf = np.zeros((buf_sz, 2), dtype=np.float32)
             self._room_delay_ptr = 0
-            
-        # 2. Define Taps (Time in ms, Gain, L/R Swap)
-        taps = [
-            (4.3, 0.45, False),  # Strong first reflection
-            (7.1, 0.35, True),   # Cross-channel reflection
-            (11.4, 0.25, False), # Secondary
-            (17.8, 0.15, True),  # Late early-reflection
-        ]
-        
-        # Convert ms to samples
-        tap_samples = [(int(ms * sr / 1000.0), g, swap) for ms, g, swap in taps]
-        
-        # 3. Process Block
         buf_len = self._room_delay_buf.shape[0]
         w_idx = (self._room_delay_ptr + np.arange(frames)) % buf_len
-        
-        # Write current block to delay buffer
-        self._room_delay_buf[w_idx, :] = block
-        
-        # Accumulate reflections
-        reflections = np.zeros_like(block)
-        for d_smp, g, swap in tap_samples:
-            r_idx = (w_idx - d_smp) % buf_len
-            if swap and n_ch >= 2:
-                reflections[:, 0] += self._room_delay_buf[r_idx, 1] * g
-                reflections[:, 1] += self._room_delay_buf[r_idx, 0] * g
-                if n_ch > 2:
-                    reflections[:, 2:] += self._room_delay_buf[r_idx, 2:] * (g * 0.5)
-            else:
-                reflections += self._room_delay_buf[r_idx, :] * g
-                
-        # 4. Apply Damping (LPF) to reflections
-        for ch in range(n_ch):
-            zi = self._ensure_sos_zi(self._room_lp_zi, ch, self._room_lp_sos)
-            reflections[:, ch], self._room_lp_zi[ch] = sosfilt(self._room_lp_sos, reflections[:, ch], zi=zi)
-            
-        # 5. Mix back
-        mix = self._live_param('virtual_room_mix')
-        # Normalize sum of reflections (Sum of gains ~ 1.2)
-        reflections *= 0.5 
-        
-        block += reflections * mix
-        
-        # Update pointer
+        self._room_delay_buf[w_idx, :] = src
         self._room_delay_ptr = (self._room_delay_ptr + frames) % buf_len
+
+        def tap(ms, swap):
+            r_idx = (w_idx - int(ms * sr / 1000.0)) % buf_len
+            refl = self._room_delay_buf[r_idx, :]
+            return refl[:, ::-1] if swap else refl
+
+        if n_ch >= 6:
+            side = 0.45 * tap(4.3, False) + 0.35 * tap(7.1, True)
+            back = 0.25 * tap(11.4, False) + 0.15 * tap(17.8, True)
+            if n_ch >= 8:
+                targets = {(6, 7): side, (4, 5): back}
+            else:
+                targets = {(4, 5): side + back}
+        else:
+            front = (0.45 * tap(4.3, False) + 0.35 * tap(7.1, True)
+                     + 0.25 * tap(11.4, False) + 0.15 * tap(17.8, True))
+            targets = {(0, 1): front}
+
+        # Damping (wall absorption) and mix
+        for (cl, cr), refl in targets.items():
+            for ch, sig in ((cl, refl[:, 0]), (cr, refl[:, 1])):
+                zi = self._ensure_sos_zi(self._room_lp_zi, ch, self._room_lp_sos)
+                damped, self._room_lp_zi[ch] = sosfilt(self._room_lp_sos, sig, zi=zi)
+                block[:, ch] += (0.5 * mix) * damped
 
     def _apply_air_exciter(self, block):
         """Harmonic Air Exciter: Restores/Enhances 10kHz+ detail using non-linear saturation."""
@@ -2172,9 +2167,20 @@ class AudioBypass:
         if transient_active:
             self._apply_transient_restore(out_block, ref_block=pre_micro_dyn)
 
-        # #12 Transaural Widening
-        if getattr(self, 'transaural_widening', False):
+        # #12 Transaural Widening (crosstalk cancellation of the L/R pair).
+        # Only without a center channel: with one, a source panned between L
+        # and C would be cancelled on half of its image only, smearing it. The
+        # front stage width then comes from the real speakers instead. Faded
+        # in/out so switching never clicks.
+        xtc_target = 1.0 if (getattr(self, 'transaural_widening', False)
+                             and not getattr(self, '_center_in_use', False)) else 0.0
+        if xtc_target > 0.0 or getattr(self, '_last_xtc_mix', 0.0) > 0.0:
+            if not hasattr(self, '_last_xtc_mix'):
+                self._last_xtc_mix = 0.0
+            dry = out_block[:, :2].copy()
             self._apply_transaural_widener(out_block, frames)
+            mix = self._get_ramp('_last_xtc_mix', xtc_target, frames)[:, np.newaxis]
+            out_block[:, :2] = dry * (1.0 - mix) + out_block[:, :2] * mix
 
         # #21 Headphone Externalization (after transaural, for HP mode)
         if getattr(self, 'hp_externalization', False):
@@ -3469,6 +3475,10 @@ class AudioBypass:
                 out_block[:, 6] *= bal_l
                 out_block[:, 7] *= bal_r
 
+        # Is a real center channel in use? (XTC only makes sense without one)
+        self._center_in_use = out_ch > 2 and (
+            self.is_multichannel_detected if is_passthrough else bool(self.center_extraction))
+
         # ─── Post-Upmix Effects Pipeline ───
         self._apply_post_effects(out_block, out_ch, skip_subsynth=force_passthrough,
                                  src_block=src_block, is_passthrough=is_passthrough)
@@ -3514,7 +3524,7 @@ class AudioBypass:
             engine.reset()
             self._delay_hist = {}
             self._spectral_was_active = True
-        width = self.width_factor * getattr(self, '_dynamic_width_ratio', 1.0)
+        width = self.width_factor
         # Cinema / gaming steering: front/back placement from L/R phase
         if getattr(self, 'cinema_steering', False):
             steering = STEER_GAMING if getattr(self, 'gaming_panning', False) else STEER_CINEMA
@@ -3560,27 +3570,69 @@ class AudioBypass:
 
         if out_ch <= 4:
             return
-        # Surround ambience: 10 ms later than the fronts (precedence keeps the
-        # image in front) and always decorrelated from them. A plain delayed
-        # copy of the front ambience comb-filters with it at the listening
-        # position (notches every 100 Hz: audible phasiness).
-        haas = int(0.010 * self.sample_rate)
-        sa = self._delay_block('spec_haas', np.stack((al * r_amb, ar * r_amb), axis=1), haas)
-        sa_l, sa_r = sa[:, 0], sa[:, 1]
-        sa_l, sa_r = self._apply_surround_decorrelation(sa_l, sa_r, bank='spectral')
+        (amb_sl, amb_sr), amb_backs = self._surround_ambience((al * r_amb, ar * r_amb), out_ch, bank='spectral')
+        # + steered rear point sources (cinema / gaming), time-aligned
         if out_ch >= 8:
-            # 7.1: sides (6/7) carry most of it, backs (4/5) a later, diffused copy
-            back = self._delay_block('spec_back', np.stack((sa_l, sa_r), axis=1), int(0.008 * self.sample_rate))
-            # 3 all-pass stages are enough on top of the 8 ms offset from the sides
-            amb_back_l, amb_back_r = self._apply_surround_decorrelation(back[:, 0], back[:, 1], bank='spectral_back', stages=3)
-            # + steered rear point sources (cinema / gaming), time-aligned
-            out_block[:, 6] = 0.8 * sa_l + side_l
-            out_block[:, 7] = 0.8 * sa_r + side_r
-            out_block[:, 4] = 0.6 * amb_back_l + back_l
-            out_block[:, 5] = 0.6 * amb_back_r + back_r
+            out_block[:, 6] = amb_sl + side_l
+            out_block[:, 7] = amb_sr + side_r
+            out_block[:, 4] = amb_backs[0] + back_l
+            out_block[:, 5] = amb_backs[1] + back_r
         else:
-            out_block[:, 4] = sa_l + side_l
-            out_block[:, 5] = sa_r + side_r
+            out_block[:, 4] = amb_sl + side_l
+            out_block[:, 5] = amb_sr + side_r
+
+    def _bass_split(self, sig, key, cutoff_hz=200.0):
+        """Stateful 2nd-order low-pass; (sig - result) is the complementary high part."""
+        sos = getattr(self, '_bass_split_sos', None)
+        if sos is None or getattr(self, '_bass_split_sr', None) != self.sample_rate:
+            sos = self._bass_split_sos = butter(2, cutoff_hz / (self.sample_rate / 2.0), btype='low', output='sos')
+            self._bass_split_sr = self.sample_rate
+            self._bass_split_zi = {}
+        zi = self._ensure_sos_zi(self._bass_split_zi, key, sos)
+        low, self._bass_split_zi[key] = sosfilt(sos, sig, zi=zi)
+        return low.astype(np.float32)
+
+    def _surround_ambience(self, amb, out_ch, bank):
+        """Ambience (one signal or an (L, R) pair) -> surround feeds.
+
+        Psychoacoustics: ambience must not be a coherent copy of the fronts or
+        of the other surrounds (comb filtering / phasiness), should arrive
+        ~10 ms after the fronts (precedence keeps the image in front), and is
+        duller than direct sound (gentle -2.5 dB shelf above ~7 kHz, which also
+        hides residual sibilance leaking into the surrounds). On 7.1 the sides
+        carry most of it (envelopment comes from lateral energy) and the backs
+        a later, further-diffused copy; total power is preserved.
+
+        Returns ((side_l, side_r), (back_l, back_r) or None).
+        """
+        if isinstance(amb, tuple):
+            pair = np.stack(amb, axis=1).astype(np.float32)
+        else:
+            pair = np.stack((amb, amb), axis=1).astype(np.float32)
+        pair = self._ambience_shelf(pair, bank)
+        pair = self._delay_block(f'{bank}_haas', pair, int(0.010 * self.sample_rate))
+        sl, sr = self._apply_surround_decorrelation(pair[:, 0], pair[:, 1], bank=bank)
+        if out_ch < 8:
+            return (sl, sr), None
+        back = self._delay_block(f'{bank}_back', np.stack((sl, sr), axis=1), int(0.008 * self.sample_rate))
+        bl, br = self._apply_surround_decorrelation(back[:, 0], back[:, 1], bank=f'{bank}_back', stages=3)
+        return (0.8 * sl, 0.8 * sr), (0.6 * bl, 0.6 * br)
+
+    def _ambience_shelf(self, pair, key, corner_hz=7000.0, cut_db=-2.5):
+        """First-order high shelf: x - k * HP(x)."""
+        sos = getattr(self, '_amb_shelf_sos', None)
+        if sos is None or getattr(self, '_amb_shelf_sr', None) != self.sample_rate:
+            sos = self._amb_shelf_sos = butter(1, min(0.95, corner_hz / (self.sample_rate / 2.0)), btype='high', output='sos')
+            self._amb_shelf_sr = self.sample_rate
+            self._amb_shelf_zi = {}
+        k = 1.0 - 10 ** (cut_db / 20.0)
+        out = np.empty_like(pair)
+        for ch in range(pair.shape[1]):
+            zkey = f'{key}_{ch}'
+            zi = self._ensure_sos_zi(self._amb_shelf_zi, zkey, sos)
+            hp, self._amb_shelf_zi[zkey] = sosfilt(sos, pair[:, ch], zi=zi)
+            out[:, ch] = pair[:, ch] - k * hp
+        return out
 
     def _downmix_extra_channels(self, src_block, out_block, out_ch):
         """Fold input channels the output layout lacks into the ones it has.
@@ -3638,6 +3690,8 @@ class AudioBypass:
             ramp = self._get_ramp('_last_pass_dyn', boost_factor, frames)
             out_block[:, 3] *= ramp
 
+    CLASSIC_MATCH_GAIN = 1.116  # +0.95 dB, see end of _route_upmix
+
     def _route_upmix(self, src_block, out_block, out_ch):
         """Static / cinema / gaming Mid-Side upmix of the front pair."""
         # 2. Advanced Upmix Steering
@@ -3648,6 +3702,13 @@ class AudioBypass:
         Mid = (L + R) * 0.5
         Side_L_base = L - Mid
         Side_R_base = R - Mid
+        # Below ~200 Hz nothing is moved (as in the spectral engine): bass
+        # stays in L/R, so the center and the surrounds never get bass that
+        # would comb-filter against the fronts or change the body of the mix.
+        mid_lo = self._bass_split(Mid, 'classic_mid')
+        side_lo = self._bass_split(Side_L_base, 'classic_side')
+        mid_hi = Mid - mid_lo
+        side_hi = Side_L_base - side_lo
 
         # Calculate dynamic offsets OR adaptive steering
         cinema_active = getattr(self, 'cinema_steering', False)
@@ -3665,10 +3726,8 @@ class AudioBypass:
         else:
              current_narrow = 0.5 # Default balanced
 
-        # Applied values stacked over sliders (or auto-pilot)
-        ratio_z = getattr(self, '_dynamic_width_ratio', 1.0)
         width_factor = self.width_factor
-        applied_width = max(0.5, min(2.0, width_factor * ratio_z))
+        applied_width = max(0.5, min(2.0, width_factor))
         applied_spread = max(0.0, min(1.0, self.center_spread))
 
         if cinema_active:
@@ -3695,61 +3754,59 @@ class AudioBypass:
         cg_r = self._get_ramp('_last_cg', center_gain, frames)
         pg_r = self._get_ramp('_last_pg', phantom_gain, frames)
         
-        # Apply Ramps
-        center_signal = Mid * cg_r
-        phantom_mid = Mid * pg_r
-        
-        # Final extraction scaling
-        Side_L = Side_L_base * aw_r
-        Side_R = Side_R_base * aw_r
+        # Apply Ramps (bass mid always stays a phantom in the fronts)
+        center_signal = mid_hi * cg_r
+        phantom_mid = mid_lo + mid_hi * pg_r
+        phantom_hi = mid_hi * pg_r
+
+        # Final extraction scaling (side above the bass handover)
+        side = side_hi * aw_r
 
         # Widening Mode Buffering (Always update to prevent pops)
         # Zero-fill on toggle to prevent ghost audio from stale buffer
-        widening_on = hasattr(self, 'widening_mode') and self.widening_mode
+        widening_on = bool(getattr(self, 'widening_mode', False))
         if widening_on and not self._widening_was_on:
             self.widening_buffer.fill(0.0)
         self._widening_was_on = widening_on
 
-        frames = phantom_mid.shape[0]
+        frames = phantom_hi.shape[0]
         end1 = min(frames, self.widening_buffer_size - self.widening_write_ptr)
-        self.widening_buffer[self.widening_write_ptr : self.widening_write_ptr + end1] = phantom_mid[:end1]
+        self.widening_buffer[self.widening_write_ptr : self.widening_write_ptr + end1] = phantom_hi[:end1]
         if end1 < frames:
-            self.widening_buffer[:frames - end1] = phantom_mid[end1:frames]
-        
+            self.widening_buffer[:frames - end1] = phantom_hi[end1:frames]
+
         delay_samples = int(self.sample_rate * (self.widening_delay_ms / 1000.0))
         read_ptr = (self.widening_write_ptr - delay_samples) % self.widening_buffer_size
-        
+
         delayed_mid = np.zeros(frames, dtype=np.float32)
         end_r1 = min(frames, self.widening_buffer_size - read_ptr)
         delayed_mid[:end_r1] = self.widening_buffer[read_ptr : read_ptr + end_r1]
         if end_r1 < frames:
             delayed_mid[end_r1:frames] = self.widening_buffer[:frames - end_r1]
-            
+
         self.widening_write_ptr = (self.widening_write_ptr + frames) % self.widening_buffer_size
 
         # Side Gain Scaling (dB to linear)
         s_gain = 10 ** (self.side_gain_db / 20.0)
 
-        # Distribution Scales
+        # Distribution Scales (constant power front/rear, like the spectral engine)
         if cinema_active:
              # Cinema Steering: Anti-phase goes strictly back
              # angle maps narrowness from 1.0 (Mono, Front) to 0.0 (Anti, Rear)
              side_angle_cin = (1.0 - current_narrow) * (math.pi / 2.0)
-                 
              front_scale = math.cos(side_angle_cin)
              rear_scale = math.sin(side_angle_cin)
              side_boost = 1.0
         else:
-             front_scale = (self.gui_panning_y + 1.0) / 2.0
-             rear_scale = 1.0 - front_scale
+             fade = (1.0 - (self.gui_panning_y + 1.0) / 2.0) * (math.pi / 2.0)
+             front_scale = math.cos(fade)
+             rear_scale = math.sin(fade)
              side_boost = s_gain
-        
+
         # 2. Ramping for Distribution Scales
         fs_r = self._get_ramp('_last_fs', front_scale, frames)
         rs_r = self._get_ramp('_last_rs', rear_scale, frames)
         sb_r = self._get_ramp('_last_sb', side_boost, frames)
-        
-        # Pan Constraints removed from here, moved to global post-upmix
 
         # Final Channel Build (Apply steering weights)
         gap_active = cinema_active and getattr(self, 'gaming_panning', False)
@@ -3762,72 +3819,56 @@ class AudioBypass:
                   side_angle_gap = math.pi / 2.0
              fg = math.cos(side_angle_gap)
              rg = math.sin(side_angle_gap)
-             
+
              # Smoothly scale phantom_mid in front based on narrowness
              front_mid_fade = max(0.0, min(1.0, (current_narrow - 0.5) * 2.0))
-             FL = (Side_L * fg + phantom_mid * front_mid_fade)
-             FR = (Side_R * fg + phantom_mid * front_mid_fade)
+             FL = side_lo + side * fg + mid_lo + phantom_hi * front_mid_fade
+             FR = -side_lo - side * fg + mid_lo + phantom_hi * front_mid_fade
         else:
-             FL = (Side_L * fs_r + phantom_mid)
-             FR = (Side_R * fs_r + phantom_mid)
-        
+             FL = side_lo + side * fs_r + phantom_mid
+             FR = -side_lo - side * fs_r + phantom_mid
+
         # Center Extraction Focus
-        # If center_extraction is false, we kill the center channel entirely 
-        # and fold EVERYTHING back (already handled by phantom_mid if spread is 1.0)
-        # but if extraction is on, we use the center_signal.
         center_extraction_active = self.center_extraction
         Center = center_signal if center_extraction_active else 0.0
         if not center_extraction_active:
-            # Re-re-fold if extraction is manually disabled (Legacy toggle support)
+            # Re-fold if extraction is manually disabled (Legacy toggle support)
             FL += center_signal * 0.5
             FR += center_signal * 0.5
 
-        # BL/BR default to None — will fall back to SL/SR in routing below
-        BL = None
-        BR = None
-
-        # Surrounds scale by rear activity and side gain
+        sides = None   # (left, right) for the side pair / 5.1 surrounds
+        backs = None   # (left, right) for the 7.1 back pair
         if gap_active:
-             # Add remaining phantom_mid to surrounds for gap_active
-             rear_mid_contrib = phantom_mid * (1.0 - front_mid_fade)
-             base_L = (Side_L * rg * sb_r + rear_mid_contrib)
-             base_R = (Side_R * rg * sb_r + rear_mid_contrib)
-
-             # Option A: 7.1 Split — continuous crossfade (no hard threshold)
-             # sl_f goes from 1.0 (narrow=0) to 1.0 (narrow=1); bl_f from 1.0 to 0.0
+             # Gaming: L/R-like point sources (mid +/- side), time-aligned with
+             # the fronts and not diffused (positional audio)
+             rear_mid_contrib = phantom_hi * (1.0 - front_mid_fade)
+             base_L = side * rg * sb_r + rear_mid_contrib
+             base_R = -side * rg * sb_r + rear_mid_contrib
              if out_ch >= 7:
-                  bl_f = max(0.0, 1.0 - current_narrow * 2.0)  # 1.0→0.0 as narrow 0→0.5+
-                  SL = base_L
-                  SR = base_R
-                  BL = base_L * bl_f
-                  BR = base_R * bl_f
-
-             # Option B: 5.1 EQ Shading — always run LPF, crossfade by narrowness
+                  # 7.1 split: continuous crossfade toward the backs as content goes rear
+                  bl_f = max(0.0, 1.0 - current_narrow * 2.0)
+                  sides = (base_L, base_R)
+                  backs = (base_L * bl_f, base_R * bl_f)
              else:
+                  # 5.1 EQ Shading — always run LPF, crossfade by narrowness
                   alpha = 0.5
                   SL_lp, self._prev_SL = lfilter([alpha], [1, -(1 - alpha)], base_L.astype(np.float64), zi=self._prev_SL)
                   SR_lp, self._prev_SR = lfilter([alpha], [1, -(1 - alpha)], base_R.astype(np.float64), zi=self._prev_SR)
-                  # Crossfade: narrow>0.5 → fully unfiltered, narrow<0.5 → fully filtered
                   lp_blend = max(0.0, min(1.0, 1.0 - current_narrow * 2.0))
-                  SL = (base_L * (1.0 - lp_blend) + SL_lp.astype(np.float32) * lp_blend)
-                  SR = (base_R * (1.0 - lp_blend) + SR_lp.astype(np.float32) * lp_blend)
-        else:
-             SL = Side_L * rs_r * sb_r
-             SR = Side_R * rs_r * sb_r
-        
-        if hasattr(self, 'widening_mode') and self.widening_mode:
-            # Inject delayed center spread into surrounds
-            SL += delayed_mid * rs_r * sb_r
-            SR += delayed_mid * rs_r * sb_r
-
-        # #22 Surround Decorrelation: all-pass phase diffusion on surround content
-        # Makes surrounds sound ambient rather than 'delayed copy of fronts'
-        # Skipped in gaming mode — surrounds carry discrete positional audio there,
-        # and decorrelation would smear spatial precision.
-        if getattr(self, 'surround_decorrelation', False) and not gap_active:
-            SL, SR = self._apply_surround_decorrelation(SL, SR)
-            if BL is not None:
-                BL, BR = self._apply_surround_decorrelation(BL, BR)
+                  sides = (base_L * (1.0 - lp_blend) + SL_lp.astype(np.float32) * lp_blend,
+                           base_R * (1.0 - lp_blend) + SR_lp.astype(np.float32) * lp_blend)
+        elif out_ch > 4:
+             # Static / cinema: the side (ambience) signal feeds BOTH surrounds
+             # with the same polarity (L-R and R-L played as an inverted pair
+             # sounds phasey and cancels), decorrelated so the pair - and the
+             # surrounds vs. the fronts - are not coherent copies, 10 ms later
+             # than the fronts (precedence keeps the image in front) and with
+             # a gentle top-octave roll-off, like real lateral ambience.
+             amb = side * rs_r * sb_r
+             if widening_on:
+                 amb = amb + delayed_mid * rs_r * sb_r
+             amb = self._surround_ambience(amb, out_ch, bank='classic')
+             sides, backs = amb
 
         # Consistent Sub Level: L+R redirected at -10dB (0.316), full band (see passthrough)
         LFE = (L + R) * 0.316
@@ -3842,24 +3883,28 @@ class AudioBypass:
             ramp = self._get_ramp('_last_up_dyn', boost_factor, LFE.shape[0])
             LFE *= ramp
 
-        out_block[:, 0] = FL
-        out_block[:, 1] = FR
+        # Level match with the spectral engine (measured on diffuse, partly
+        # coherent and panned material: classic was ~0.95 dB quieter), so an
+        # A/B between the engines is not decided by loudness. LFE untouched.
+        g = self.CLASSIC_MATCH_GAIN
+        out_block[:, 0] = FL * g
+        out_block[:, 1] = FR * g
         if out_ch > 2:
             # Apply Stage Equalizer Weighting (-3dB)
             c_weight = 0.707 if self.stage_equalizer else 1.0
-            out_block[:, 2] = Center * c_weight
+            out_block[:, 2] = Center * (c_weight * g)
 
         if out_ch > 3: out_block[:, 3] = LFE if not self.lfe_muted else 0.0
 
-        # Surround Replication
-        for i in range(4, out_ch):
-            if i == 4: out_block[:, 4] = SL
-            elif i == 5: out_block[:, 5] = SR
-            elif i == 6: out_block[:, 6] = BL if BL is not None else SL
-            elif i == 7: out_block[:, 7] = BR if BR is not None else SR
+        # Surrounds, Windows order: FL FR C LFE BL BR SL SR (5.1: 4/5 = surrounds)
+        if sides is not None:
+            sides = (sides[0] * g, sides[1] * g)
+            if out_ch >= 8:
+                out_block[:, 6], out_block[:, 7] = sides
+                if backs is not None:
+                    out_block[:, 4], out_block[:, 5] = backs[0] * g, backs[1] * g
             else:
-                if i % 2 == 0: out_block[:, i] = SL
-                else: out_block[:, i] = SR
+                out_block[:, 4], out_block[:, 5] = sides
 
     def _read_input_block(self, frames):
         """Pull `frames` samples from the input ring buffer (None on underrun).
