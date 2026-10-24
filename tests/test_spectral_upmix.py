@@ -47,13 +47,13 @@ def test_reconstruction_is_exact_and_latency_is_fixed():
     lat = SpectralUpmixer(SR).latency
     assert lat == 1024
     for ch, (d, a) in enumerate(((DIRECT_L, AMBIENT_L), (DIRECT_R, AMBIENT_R))):
-        np.testing.assert_allclose(out[lat:, d] + out[lat:, a], x[:-lat, ch], atol=1e-9)
+        np.testing.assert_allclose(out[lat:, d] + out[lat:, a], x[:-lat, ch], atol=1e-6)  # float32 processing
 
 
 @pytest.mark.parametrize("block", [441, 512, 1024, 37])
 def test_output_does_not_depend_on_block_size(block):
     x = rng.standard_normal((SR, 2)) * 0.1
-    np.testing.assert_allclose(run(x, block=block), run(x), atol=1e-12)
+    np.testing.assert_allclose(run(x, block=block), run(x), atol=1e-6)
 
 
 def test_mono_goes_to_center_only():
@@ -271,7 +271,7 @@ def test_cinema_leaves_in_phase_content_in_front():
     out = run(pan(tone(700), -0.4), steering=STEER_CINEMA)
     assert rear_db(out) < -100
     ref = run(pan(tone(700), -0.4), steering=STEER_OFF)
-    np.testing.assert_allclose(out[:, DIRECT_L], ref[:, DIRECT_L], atol=1e-9)
+    np.testing.assert_allclose(out[:, DIRECT_L], ref[:, DIRECT_L], atol=1e-6)
 
 
 def _rear_share(out):
@@ -301,3 +301,47 @@ def test_engine_cinema_with_spectral_on_5_1(engine):
     tail = slice(2 * SR, 3 * SR)
     assert db(out[tail, 4]) > db(out[tail, 2]) + 30
     assert db(out[tail, 5]) > -40
+
+
+# ── Musical noise ("low-bitrate" twinkle) ───────────────────────────────
+
+from scipy.ndimage import uniform_filter  # noqa: E402
+
+
+def _spike_energy_db(sig, ref):
+    """Energy in isolated time-frequency spikes (>7 dB over their 7x7
+    neighbourhood) in 1.5-16 kHz, relative to the input energy there."""
+    n, h = 1024, 256
+    w = np.hanning(n)
+    f = np.fft.rfftfreq(n, 1 / SR)
+    band = (f > 1500) & (f < 16000)
+    spec = lambda s: np.array([np.abs(np.fft.rfft(s[i:i + n] * w))[band] ** 2 for i in range(0, len(s) - n, h)])
+    P = spec(sig)
+    spikes = P > 5 * uniform_filter(P, size=7, mode='nearest')
+    return 10 * np.log10(P[spikes].sum() / spec(ref).sum() + 1e-15)
+
+
+@pytest.mark.parametrize("coherent_share, limit_db", [(0.0, -60.0), (1.0, -30.0)])
+def test_noise_like_content_does_not_twinkle_in_the_center(coherent_share, limit_db):
+    """Reverb / cymbal-like noise must not be scattered bin by bin into the
+    center (that is what sounds like an old low-bitrate stream)."""
+    r = np.random.default_rng(1)
+    a, b, c = r.standard_normal((3, SR * 3)) * 0.05
+    x = np.stack([a + coherent_share * c, b + coherent_share * c], axis=1) * (0.7 if coherent_share else 1.0)
+    out = run(x)[SR:]
+    assert _spike_energy_db(out[:, DIRECT_C], x[SR:, 0]) < limit_db
+
+
+def test_close_notes_do_not_intermodulate():
+    tt = np.arange(SR * 4) / SR
+    a = sum(0.15 / k * np.sin(2 * np.pi * 1000 * k * tt) for k in (1, 2, 3))
+    b = sum(0.15 / k * np.sin(2 * np.pi * 1020 * k * tt) for k in (1, 2, 3))
+    out = run(np.stack([0.7071 * a + np.cos(np.pi / 20) * b, 0.7071 * a + np.sin(np.pi / 20) * b], axis=1))
+    seg = out[2 * SR:, DIRECT_C] * np.hanning(2 * SR)
+    sp = np.abs(np.fft.rfft(seg)) ** 2
+    fr = np.fft.rfftfreq(2 * SR, 1 / SR)
+    near = np.zeros_like(fr, bool)
+    for f0 in (1000, 2000, 3000, 1020, 2040, 3060):
+        near |= np.abs(fr - f0) < 3
+    inband = (fr > 200) & (fr < 8000)
+    assert 10 * np.log10(sp[inband & ~near].sum() / sp[near].sum()) < -40

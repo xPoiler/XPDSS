@@ -1797,7 +1797,7 @@ class AudioBypass:
         block *= gain_linear.astype(np.float32)
 
     # ─── #22 Surround Decorrelation (All-Pass Diffuser) ────────────────────
-    def _apply_surround_decorrelation(self, sig_L, sig_R, bank='classic'):
+    def _apply_surround_decorrelation(self, sig_L, sig_R, bank='classic', stages=6):
         """Apply cascaded all-pass diffuser to side-channel content for surround routing.
 
         Makes surrounds sound genuinely ambient rather than 'delayed copy of fronts',
@@ -1835,7 +1835,7 @@ class AudioBypass:
             out = np.asarray(sig, dtype=np.float64)
             delays = self._decorr_delays if ch_tag == 'L' else self._decorr_delays_R
             coeffs = self._decorr_coeffs if ch_tag == 'L' else self._decorr_coeffs_R
-            for i, (delay, coeff) in enumerate(zip(delays, coeffs)):
+            for i, (delay, coeff) in enumerate(list(zip(delays, coeffs))[:stages]):
                 state = states[ch_tag][i]
                 if 'zi' not in state:
                     b_ap = np.zeros(delay + 1); b_ap[0] = -coeff; b_ap[delay] = 1.0
@@ -2889,6 +2889,13 @@ class AudioBypass:
                     g_min[:, gi] = minimum_filter1d(seg, size=h + 1, mode='nearest')[h // 2:h // 2 + n]
 
         gr = 1.0 - g_min
+        if gr.max() <= 0.0 and self._limiter_gr_zi.max() < 1e-7:
+            # Nothing to limit and the previous release has finished: unity
+            # gain, no envelope work (the normal case)
+            self._limiter_gr_zi = np.zeros_like(self._limiter_gr_zi)
+            out = combined[:n].copy()
+            np.clip(out, -1.0, 1.0, out=out)
+            return out
         release = np.exp(-1.0 / (self.sample_rate * np.asarray(release_ms) / 1000.0)).reshape(1, -1)
         gr_env, self._limiter_gr_zi = self._asym_env_decimated(gr, 0.0, release, self._limiter_gr_zi)
         group_gain = 1.0 - np.maximum(gr_env, gr)
@@ -3563,7 +3570,8 @@ class AudioBypass:
         if out_ch >= 8:
             # 7.1: sides (6/7) carry most of it, backs (4/5) a later, diffused copy
             back = self._delay_block('spec_back', np.stack((sa_l, sa_r), axis=1), int(0.008 * self.sample_rate))
-            amb_back_l, amb_back_r = self._apply_surround_decorrelation(back[:, 0], back[:, 1], bank='spectral_back')
+            # 3 all-pass stages are enough on top of the 8 ms offset from the sides
+            amb_back_l, amb_back_r = self._apply_surround_decorrelation(back[:, 0], back[:, 1], bank='spectral_back', stages=3)
             # + steered rear point sources (cinema / gaming), time-aligned
             out_block[:, 6] = 0.8 * sa_l + side_l
             out_block[:, 7] = 0.8 * sa_r + side_r
