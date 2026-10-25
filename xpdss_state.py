@@ -17,6 +17,8 @@ PROFILE_DEFAULTS: Dict[str, Any] = {
     "width_factor": 1.0,
     "envelopment": 0.7,   # spectral: how much partly-coherent sound counts as ambience
     "wrap_amount": 0.4,   # spectral: wide-panned sources extend toward the side surrounds
+    "immersive": False,       # room expansion + low-frequency decorrelation + wider ambience field
+    "hard_pan_sides": False,  # spectral: hard-panned sources play from the side surrounds
     "dynamic_eq": False,
     "cinema_steering": False,
     "gaming_panning": False,

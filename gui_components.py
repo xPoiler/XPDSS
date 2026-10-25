@@ -508,6 +508,15 @@ class UpmixerWindow(QMainWindow):
                  "Side Gain = surround ambience level, Envelopment = how much is ambience,\n"
                  "Wrap = wide sources toward the sides, radar Y = ambience front/rear\n"
                  "(middle: fronts keep it and the surrounds add it around you)."),
+                ("IMMERSIVE", "immersive",
+                 "More envelopment, like an AVR's room / Auro-Matic modes (both engines):\n"
+                 "a subtle decorrelated late reverb around you (room expansion, ~1 s),\n"
+                 "ambience diffused down into the low mids, and a wider ambience field.\n"
+                 "Adds a room that is not in the recording: off for strictly faithful playback."),
+                ("HARD PANS → SIDES", "hard_pan_sides",
+                 "Spectral upmix: sounds panned hard left/right in the mix play from the\n"
+                 "side surrounds instead of the fronts (from ~60% pan it moves outward,\n"
+                 "fully at ~95%). Centre and half-panned sources stay in front."),
                 ("STAGE EQUALIZER", "stage_equalizer", "Balance front/surround weight."),
                 ("CENTER FOCUS", "center_extraction", "Extract dialogue to center speaker."),
                 ("CINEMA STEERING", "cinema_steering",
@@ -1034,6 +1043,10 @@ class UpmixerWindow(QMainWindow):
         for name in ('sld_envelopment', 'sld_wrap'):
             if hasattr(self, name):
                 getattr(self, name).setDisabled(not is_spectral or is_stereo)
+        if 'hard_pan_sides' in self.option_buttons:
+            self.option_buttons['hard_pan_sides'].setEnabled(is_spectral and not is_stereo)
+        if 'immersive' in self.option_buttons:
+            self.option_buttons['immersive'].setEnabled(not is_stereo)
 
         # 3. Stereo output disables surround features
         if is_stereo:
@@ -1052,7 +1065,8 @@ class UpmixerWindow(QMainWindow):
 
         # 4. Mode-exclusive visibility
         speaker_only = ['transaural_widening', 'cinema_steering', 'gaming_panning', 'stage_equalizer', 'spectral_upmix',
-                        'head_tracking', 'center_extraction', 'lfe_muted', 'vocal_lock', 'freq_dep_width']
+                        'head_tracking', 'center_extraction', 'lfe_muted', 'vocal_lock', 'freq_dep_width',
+                        'immersive', 'hard_pan_sides']
         headphone_only = ['head_shadow_eq', 'headphone_tracking', 'hp_externalization']
 
         for f in speaker_only:

@@ -14,6 +14,7 @@ import numpy as np
 import json
 from adaptive_control import ADAPTIVE_PARAMS, AdaptiveController
 from adaptive_renderer import AdaptiveFeatureEngine
+from room_expansion import RoomExpander
 from spectral_upmix import STEER_CINEMA, STEER_GAMING, STEER_OFF, SpectralUpmixer
 from xpdss_state import (
     apply_adaptive_state_to_object,
@@ -1074,7 +1075,7 @@ class AudioBypass:
         '_sub_period_est', '_sub_need_smooth', '_sub_last_avoid',
         '_vl_voice_mask', '_dlg_bp_sos', '_dlg_bp_zi', '_air_post_zi',
         '_rs_out_pre', '_spectral', '_delay_hist', '_spectral_was_active',
-        '_bass_split_sos', '_amb_shelf_sos', '_cls_stats', '_tilt_mono_hist', '_tilt_taps_designed',
+        '_bass_split_sos', '_amb_shelf_sos', '_cls_stats', '_lf_decorr_states', '_room_expander', '_tilt_mono_hist', '_tilt_taps_designed',
     )
 
     def _reset_dsp_state(self):
@@ -1865,35 +1866,59 @@ class AudioBypass:
         states = self._decorr_ap_states[bank]
 
         def _process_channel(sig, ch_tag):
-            # Each stage: y[n] = -g*x[n] + x[n-D] + g*y[n-D]  (Schroeder all-pass).
-            # The feedback only links samples D apart, so the recursion is D
-            # interleaved first-order filters: reshape to rows of D samples and
-            # run one first-order lfilter down the rows (O(n), no Python loop).
-            out = np.asarray(sig, dtype=np.float64)
-            n = out.shape[0]
             delays = self._decorr_delays if ch_tag == 'L' else self._decorr_delays_R
             coeffs = self._decorr_coeffs if ch_tag == 'L' else self._decorr_coeffs_R
-            for i, (delay, coeff) in enumerate(list(zip(delays, coeffs))[:stages]):
-                state = states[ch_tag][i]
-                if 'x_hist' not in state:
-                    state['x_hist'] = np.zeros(delay)
-                    state['y_hist'] = np.zeros(delay)
-                x_ext = np.concatenate((state['x_hist'], out))
-                u = -coeff * out + x_ext[:n]
-                rows = -(-n // delay)
-                u_rows = np.zeros(rows * delay)
-                u_rows[:n] = u
-                y = lfilter([1.0], [1.0, -coeff], u_rows.reshape(rows, delay), axis=0,
-                            zi=(coeff * state['y_hist'])[None, :])[0].ravel()[:n]
-                state['x_hist'] = x_ext[-delay:].copy()
-                state['y_hist'] = np.concatenate((state['y_hist'], y))[-delay:].copy()
-                out = y
-            return out.astype(np.float32)
+            pairs = list(zip(delays, coeffs))[:stages]
+            return self._allpass_cascade(sig, pairs, states[ch_tag])
 
         # Use different delay orderings for L vs R to maximize decorrelation
         out_L = _process_channel(sig_L, 'L')
         out_R = _process_channel(sig_R, 'R')
         return out_L, out_R
+
+    @staticmethod
+    def _allpass_cascade(sig, pairs, state_list):
+        """Cascade of Schroeder all-passes y[n] = -g x[n] + x[n-D] + g y[n-D].
+
+        The feedback only links samples D apart, so each stage is D interleaved
+        first-order filters: rows of D samples go through one first-order
+        lfilter down the rows (O(n), no Python loop). state_list holds one
+        dict per stage.
+        """
+        out = np.asarray(sig, dtype=np.float64)
+        n = out.shape[0]
+        for i, (delay, coeff) in enumerate(pairs):
+            state = state_list[i]
+            if 'x_hist' not in state:
+                state['x_hist'] = np.zeros(delay)
+                state['y_hist'] = np.zeros(delay)
+            x_ext = np.concatenate((state['x_hist'], out))
+            u = -coeff * out + x_ext[:n]
+            rows = -(-n // delay)
+            u_rows = np.zeros(rows * delay)
+            u_rows[:n] = u
+            y = lfilter([1.0], [1.0, -coeff], u_rows.reshape(rows, delay), axis=0,
+                        zi=(coeff * state['y_hist'])[None, :])[0].ravel()[:n]
+            state['x_hist'] = x_ext[-delay:].copy()
+            state['y_hist'] = np.concatenate((state['y_hist'], y))[-delay:].copy()
+            out = y
+        return out.astype(np.float32)
+
+    # Long all-pass stages (4-11 ms) that also decorrelate the low mids, which
+    # the short diffuser (0.3-2.5 ms) leaves almost coherent (IMMERSIVE mode).
+    _LF_DECORR = {'L': ((0.0043, 0.45), (0.0067, 0.40), (0.0097, 0.45)),
+                  'R': ((0.0051, 0.40), (0.0079, 0.45), (0.0113, 0.40))}
+
+    def _apply_lf_decorrelation(self, sig_L, sig_R, bank):
+        store = self.__dict__.setdefault('_lf_decorr_states', {})
+        if bank not in store:
+            store[bank] = {tag: [{} for _ in v] for tag, v in self._LF_DECORR.items()}
+        sr = self.sample_rate
+        out = []
+        for sig, tag in ((sig_L, 'L'), (sig_R, 'R')):
+            pairs = [(max(1, int(d * sr)), g) for d, g in self._LF_DECORR[tag]]
+            out.append(self._allpass_cascade(sig, pairs, store[bank][tag]))
+        return out[0], out[1]
 
     # ─── #20 Frequency-Dependent Stereo Width ─────────────────────────────
     def _apply_freq_dep_width(self, block):
@@ -3665,7 +3690,8 @@ class AudioBypass:
             center=self.center_extraction, steering=steering,
             split_sides_backs=out_ch >= 8,
             envelopment=getattr(self, 'envelopment', 0.0),
-            wrap=getattr(self, 'wrap_amount', 0.0)).astype(np.float32)
+            wrap=getattr(self, 'wrap_amount', 0.0),
+            hard_pan_sides=bool(getattr(self, 'hard_pan_sides', False))).astype(np.float32)
         self._spec_delayed_src = self._delay_block('spec_src', src_block, engine.latency)
 
     def _route_spectral(self, out_block, out_ch):
@@ -3688,8 +3714,14 @@ class AudioBypass:
         f_amb = self._get_ramp('_last_spec_famb', f_amb_g, frames)
         r_amb = self._get_ramp('_last_spec_ramb', r_amb_g * 10 ** (self.side_gain_db / 20.0), frames)
 
-        out_block[:, 0] = dl + f_amb * al
-        out_block[:, 1] = dr + f_amb * ar
+        r = self._immersive_ramp('_last_imm_front', frames)
+        if r is not None:
+            wide = self._widen_pair(np.stack((al, ar), axis=1))
+            al_f, ar_f = al + r * (wide[:, 0] - al), ar + r * (wide[:, 1] - ar)
+        else:
+            al_f, ar_f = al, ar
+        out_block[:, 0] = dl + f_amb * al_f
+        out_block[:, 1] = dr + f_amb * ar_f
         if out_ch > 2:
             out_block[:, 2] = dc * (0.707 if self.stage_equalizer else 1.0)
 
@@ -3715,6 +3747,7 @@ class AudioBypass:
         else:
             out_block[:, 4] = amb_sl + side_l
             out_block[:, 5] = amb_sr + side_r
+        self._immersive_room((d_src[:, 0] + d_src[:, 1]) * 0.5, out_ch, out_block)
 
     def _ambience_front_rear(self):
         """Front and surround ambience gains from the radar's Y.
@@ -3755,14 +3788,78 @@ class AudioBypass:
             pair = np.stack(amb, axis=1).astype(np.float32)
         else:
             pair = np.stack((amb, amb), axis=1).astype(np.float32)
+        # IMMERSIVE parts are crossfaded in/out over one block (no clicks)
+        r = self._immersive_ramp(f'_last_imm_{bank}', pair.shape[0])
+        if r is not None:
+            pair = pair + r[:, None] * (self._widen_pair(pair) - pair)
+        elif bank in self.__dict__.get('_lf_decorr_states', {}):
+            del self._lf_decorr_states[bank]        # resume later from clean state
         pair = self._ambience_shelf(pair, bank)
         pair = self._delay_block(f'{bank}_haas', pair, int(0.010 * self.sample_rate))
         sl, sr = self._apply_surround_decorrelation(pair[:, 0], pair[:, 1], bank=bank)
+        if r is not None:
+            dl, dr = self._apply_lf_decorrelation(sl, sr, bank)
+            sl, sr = sl + r * (dl - sl), sr + r * (dr - sr)
         if out_ch < 8:
             return (sl, sr), None
         back = self._delay_block(f'{bank}_back', np.stack((sl, sr), axis=1), int(0.008 * self.sample_rate))
         bl, br = self._apply_surround_decorrelation(back[:, 0], back[:, 1], bank=f'{bank}_back', stages=3)
         return (0.8 * sl, 0.8 * sr), (0.6 * bl, 0.6 * br)
+
+    @staticmethod
+    def _widen_pair(pair, mid_gain=0.75, side_gain=1.25):
+        """Wider ambience field (IMMERSIVE): less common (mid), more difference
+        (side) between the two channels; about power-neutral on diffuse sound."""
+        mid = 0.5 * (pair[:, 0] + pair[:, 1])
+        side = 0.5 * (pair[:, 0] - pair[:, 1])
+        out = np.empty_like(pair)
+        out[:, 0] = mid_gain * mid + side_gain * side
+        out[:, 1] = mid_gain * mid - side_gain * side
+        return out
+
+    ROOM_LEVEL = 0.25   # room expansion level per surround (IMMERSIVE): late field ~13 dB under a dry source
+
+    def _immersive_ramp(self, key, frames):
+        """0..1 ramp for IMMERSIVE parts (None when fully off): switching
+        crossfades over one block instead of clicking."""
+        target = 1.0 if getattr(self, 'immersive', False) else 0.0
+        if not hasattr(self, key):
+            setattr(self, key, 0.0)
+        if getattr(self, key) == 0.0 and target == 0.0:
+            return None
+        return self._get_ramp(key, target, frames)
+
+    def _immersive_room(self, mono, out_ch, out_block):
+        """IMMERSIVE: add the decorrelated late field to the surrounds.
+
+        Switching is done on the reverb's input, so turning it off lets the
+        tail ring out naturally; once silent for 2 s the reverb is dropped.
+        """
+        if out_ch <= 4:
+            return
+        frames = out_block.shape[0]
+        on = bool(getattr(self, 'immersive', False))
+        rx = getattr(self, '_room_expander', None)
+        if not hasattr(self, '_last_room_in'):
+            self._last_room_in = 0.0
+        if not on and self._last_room_in == 0.0:
+            if rx is None:
+                return
+            self._room_idle = getattr(self, '_room_idle', 0) + frames
+            if self._room_idle > 2 * self.sample_rate:
+                self._room_expander = None
+                return
+        else:
+            self._room_idle = 0
+        if rx is None or rx.sr != self.sample_rate:
+            rx = self._room_expander = RoomExpander(self.sample_rate)
+        g_in = self._get_ramp('_last_room_in', 1.0 if on else 0.0, frames)
+        targets = [4, 5] if out_ch < 8 else [6, 7, 4, 5]
+        tail = rx.process(mono * g_in, len(targets))
+        g_out = self.ROOM_LEVEL * 10 ** (self.side_gain_db / 20.0)
+        for k, ch in enumerate(targets):
+            w = 0.7 if (out_ch >= 8 and ch in (4, 5)) else 1.0
+            out_block[:, ch] += (tail[:, k] * (g_out * w)).astype(np.float32)
 
     def _ambience_shelf(self, pair, key, corner_hz=7000.0, cut_db=-2.5):
         """First-order high shelf: x - k * HP(x)."""
@@ -4021,6 +4118,7 @@ class AudioBypass:
                     out_block[:, 4], out_block[:, 5] = backs[0] * g, backs[1] * g
             else:
                 out_block[:, 4], out_block[:, 5] = sides
+        self._immersive_room((L + R) * 0.5, out_ch, out_block)
 
     def _read_input_block(self, frames):
         """Pull `frames` samples from the input ring buffer (None on underrun).

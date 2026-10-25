@@ -126,7 +126,7 @@ class SpectralUpmixer:
     # ── streaming ─────────────────────────────────────────────────────
     def process(self, stereo: np.ndarray, center_spread: float = 0.0, width: float = 1.0,
                 center: bool = True, steering: int = STEER_OFF, split_sides_backs: bool = False,
-                envelopment: float = 0.0, wrap: float = 0.0) -> np.ndarray:
+                envelopment: float = 0.0, wrap: float = 0.0, hard_pan_sides: bool = False) -> np.ndarray:
         """Feed (frames, 2) samples, get (frames, N_STREAMS) streams delayed by `latency`.
 
         Streams: direct L/R/C (front stage), ambient L/R, and the steered
@@ -138,6 +138,8 @@ class SpectralUpmixer:
         wide pads, room) counts as ambience instead of direct sound.
         wrap (0..1): how far sources panned wide in the mix extend toward the
         side surrounds (SIDE_L/R streams), like a wider front stage.
+        hard_pan_sides: sources panned (nearly) hard left/right play from the
+        side surrounds instead of the fronts (ramp from 60 % to 95 % pan).
         """
         frames = stereo.shape[0]
         spread = 1.0 if not center else float(np.clip(center_spread, 0.0, 1.0))
@@ -153,7 +155,8 @@ class SpectralUpmixer:
         produced = []
         if frame_list:
             ys = self._process_frame(np.stack(frame_list), spread, float(width), int(steering), bool(split_sides_backs),
-                                     float(np.clip(envelopment, 0.0, 1.0)), float(np.clip(wrap, 0.0, 1.0)))
+                                     float(np.clip(envelopment, 0.0, 1.0)), float(np.clip(wrap, 0.0, 1.0)),
+                                     bool(hard_pan_sides))
             for y in ys:
                 self._ola += y
                 produced.append(self._ola[:self.hop].copy())
@@ -167,7 +170,7 @@ class SpectralUpmixer:
     # ── STFT frames ───────────────────────────────────────────────────
     def _process_frame(self, frames: np.ndarray, spread: float, width: float,
                        steering: int = STEER_OFF, split: bool = False,
-                       envelopment: float = 0.0, wrap: float = 0.0) -> np.ndarray:
+                       envelopment: float = 0.0, wrap: float = 0.0, hard_sides: bool = False) -> np.ndarray:
         """frames: (F, n, 2) consecutive analysis frames -> (F, n, N_STREAMS)."""
         X = np.fft.rfft(frames * self.win[None, :, None], axis=1).astype(np.complex64)
         L, R = X[..., 0], X[..., 1]                       # (F, bins)
@@ -340,13 +343,18 @@ class SpectralUpmixer:
         out_c = move * lcr_c * norm
 
         side_l = side_r = back_l = back_r = 0.0
-        if wrap > 0.0:
+        if wrap > 0.0 or hard_sides:
             # Wrap: sources panned wide in the mix extend from the front
             # speaker toward the side surround (constant power, up to an equal
             # split: a hard-panned source then sits around 60-70 degrees
             # instead of 30). Positions depend on the source's pan only, so
             # nothing moves around; the stage gets wider.
-            wr = wrap * np.clip((np.abs(pan) - 0.3) / 0.7, 0.0, 1.0) * w * (math.pi / 4)
+            wr = wrap * np.clip((np.abs(pan) - 0.3) / 0.7, 0.0, 1.0) * (math.pi / 4)
+            if hard_sides:
+                # Hard pans to the sides: from 60 % pan the source moves on to
+                # the side surround, entirely from 95 % (hard-panned sounds).
+                wr = np.maximum(wr, np.clip((np.abs(pan) - 0.6) / 0.35, 0.0, 1.0) * (math.pi / 2))
+            wr = wr * w
             cw, sw = np.cos(wr), np.sin(wr)
             side_l = sw * out_l
             side_r = sw * out_r
@@ -394,7 +402,7 @@ class SpectralUpmixer:
         # Only synthesise the streams in use (the rear ones are silent unless
         # steering is on; the backs only on 7.1)
         active = list(range(AMBIENT_R + 1))
-        if steering != STEER_OFF or wrap > 0.0:
+        if steering != STEER_OFF or wrap > 0.0 or hard_sides:
             active += [SIDE_L, SIDE_R]
         if steering != STEER_OFF and split:
             active += [BACK_L, BACK_R]
