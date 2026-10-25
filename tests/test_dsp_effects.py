@@ -728,3 +728,31 @@ def test_dynamics_are_linked_so_sounds_do_not_move(engine, effect):
     g_front, g_center, g_amb = gains(0), gains(2), gains(4)
     assert np.max(np.abs(g_center - g_front)) < 0.3
     assert np.max(np.abs(g_amb - g_front)) < 0.3
+
+
+def test_program_level_reads_the_input_not_the_upmixed_fronts(tmp_path):
+    """Upmixing moves the center out of L/R; the level estimate (Dynamic EQ,
+    transient gate...) must not drop because of it."""
+    s = (np.random.default_rng(4).standard_normal(SR * 2) * 0.1).astype(np.float32)
+    levels = []
+    for upmix_on in (False, True):
+        e = _new_engine(tmp_path, f"pl{upmix_on}")
+        e.upmix_enabled = upmix_on
+        upmix(e, src8(s, s))
+        levels.append(e._program_level_db)
+    assert abs(levels[0] - levels[1]) < 0.1
+
+
+def test_switching_tilt_does_not_click(engine):
+    """The tilt FIR delays by 127 samples: switching it must crossfade, not jump."""
+    t = np.arange(SR) / SR
+    x = np.zeros((SR, 6), dtype=np.float32)
+    x[:, 0] = x[:, 1] = 0.3 * np.sin(2 * np.pi * 220 * t)
+    out = x.copy()
+    for bi, i in enumerate(range(0, SR, 480)):
+        engine.spectral_tilt = (bi // 25) % 2 == 1          # toggles every 250 ms
+        b = out[i:i + 480]
+        engine._apply_post_effects(b, 6, src_block=np.pad(x[i:i + 480], ((0, 0), (0, 2))))
+    # a sine through a smooth system has a bounded second difference
+    d2 = np.abs(np.diff(out[:, 0], 2))
+    assert d2.max() < 3 * (0.3 * (2 * np.pi * 220 / SR) ** 2) * 2.0 + 1e-3

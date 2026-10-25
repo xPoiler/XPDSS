@@ -1687,9 +1687,12 @@ class AudioBypass:
         """
         sr = self.sample_rate
         frames = block.shape[0]
-        ch_count = min(block.shape[1], 2)  # measure L/R only
-
-        rms = np.sqrt(np.mean(block[:, :ch_count] ** 2) + 1e-12)
+        # Stereo level of the program: mean power of L/R; with a discrete
+        # multichannel input, the power of all main channels scaled to a stereo
+        # equivalent (LFE excluded), so 5.1 and stereo read alike.
+        mains = [c for c in range(min(block.shape[1], 8)) if c != 3]
+        power = float(np.sum(np.mean(np.asarray(block[:, mains], dtype=np.float64) ** 2, axis=0))) / 2.0
+        rms = np.sqrt(power + 1e-12)
         db = 20.0 * np.log10(rms + 1e-12)
 
         # Gate: ignore silence / near-silence so pauses between tracks
@@ -2099,7 +2102,11 @@ class AudioBypass:
         frames = out_block.shape[0]
 
         # ── Program Level Estimator (always runs, measures only) ──
-        self._update_program_level(out_block)
+        # Measured on the input: after the upmix, L/R alone miss the center
+        # (several dB low), which made level-adaptive effects (Dynamic EQ,
+        # transient gate...) think the music was quiet, and read differently
+        # in passthrough and upmix.
+        self._update_program_level(src_block if src_block is not None else out_block)
 
         # (#19 Declipping runs on the input, see _apply_upmix: after the upmix a
         # center above 0.99 is legitimate, not clipping)
@@ -2155,8 +2162,22 @@ class AudioBypass:
 
 
         # #9 Spectral Tilt Correction
-        if self.spectral_tilt:
+        # Tilt: its linear-phase FIR delays by 127 samples, so switching it
+        # crossfades over one block (an instant switch jumped in time: click).
+        # While off, its input history keeps running so it resumes cleanly.
+        tilt_on = bool(self.spectral_tilt)
+        tilt_was = getattr(self, '_tilt_was_on', False)
+        if tilt_on or tilt_was:
+            dry = out_block[:frames].copy() if tilt_on != tilt_was else None
             self._apply_spectral_tilt(out_block, frames, out_ch)
+            if dry is not None:
+                w = np.linspace(0.0, 1.0, frames, dtype=np.float32)[:, None]
+                if not tilt_on:
+                    w = 1.0 - w
+                out_block[:frames] = dry * (1.0 - w) + out_block[:frames] * w
+        else:
+            self._tilt_keep_history(out_block, frames, out_ch)
+        self._tilt_was_on = tilt_on
 
         # #23 Micro-Dynamics / Upward Compression (lifts quiet detail)
         # Snapshot before micro-dyn so transient restore can measure original dynamics
@@ -2376,6 +2397,17 @@ class AudioBypass:
         out_block[:N, 2] *= ramp
 
 
+
+    def _tilt_keep_history(self, out_block, frames, out_ch):
+        hist_len = 254
+        hist = getattr(self, '_tilt_hist', None)
+        if hist is None or hist.shape != (hist_len, out_ch):
+            hist = self._tilt_hist = np.zeros((hist_len, out_ch), dtype=np.float32)
+        if frames >= hist_len:
+            hist[:] = out_block[frames - hist_len:frames, :out_ch]
+        else:
+            hist[:-frames] = hist[frames:]
+            hist[-frames:] = out_block[:frames, :out_ch]
 
     def _apply_spectral_tilt(self, out_block, frames, out_ch):
         """Adaptive Equalization with Overlap-and-Add Carry Buffers."""
