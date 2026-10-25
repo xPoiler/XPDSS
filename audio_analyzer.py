@@ -203,8 +203,14 @@ class AudioBypass:
             self.sample_rate = 48000
         
         # Audio buffering system (Decoupled Architecture - Optimized for latency)
-        self.ring_buffer_size = int(self.sample_rate * 0.12) # 120ms safety wrap
-        self.target_latency_samples = int(self.sample_rate * 0.010) # 10ms target for low latency
+        self.ring_buffer_size = int(self.sample_rate * 0.25) # 250ms safety wrap
+        # Input reserve: starts at 10 ms and grows by 5 ms (up to 80 ms) each
+        # time the buffer runs dry, so it settles at what the virtual cable's
+        # delivery pattern actually needs (VB-Cable hands over irregular
+        # 256/512-sample chunks; a fixed 10 ms ran dry every few seconds).
+        self.target_latency_samples = int(self.sample_rate * 0.010)
+        self._target_max_samples = int(self.sample_rate * 0.080)
+        self._in_primed = False
         self.buffer = np.zeros((self.ring_buffer_size, self.max_input_ch), dtype=np.float32)
         self.write_ptr = 0
         self.read_ptr = 0
@@ -1096,7 +1102,7 @@ class AudioBypass:
             try:
                 # Re-allocate buffers if channel count or sample rate changed
                 with self.buffer_lock:
-                    ring_size = int(self.sample_rate * 0.12)
+                    ring_size = int(self.sample_rate * 0.25)
                     if self.buffer.shape[1] != self.max_input_ch or self.buffer.shape[0] != ring_size:
                         print(f"[Stream] Resizing input buffer to {self.max_input_ch} channels")
                         self.ring_buffer_size = ring_size
@@ -1109,6 +1115,7 @@ class AudioBypass:
                     self.read_ptr = 0
                     self.available_samples = 0
                     self._drift_fill_ema = None
+                    self._in_primed = False
 
                 self.input_stream = sd.InputStream(
                     device=self.input_device_id,
@@ -4020,10 +4027,24 @@ class AudioBypass:
                 self.available_samples -= excess
                 self._drift_fill_ema = None
 
+            # (Re)priming: after start or an underrun, wait until the reserve
+            # is back before playing, instead of running at the edge (one
+            # short gap rather than a stream of them).
+            if not self._in_primed:
+                if self.available_samples < target + frames:
+                    return None
+                self._in_primed = True
+                self._drift_fill_ema = None
+
             self._drift_fill_ema, adj = self._drift_adjust(
                 self._drift_fill_ema, self.available_samples - frames, target, frames)
             n_in = frames + adj
             if self.available_samples < n_in:
+                # Underrun: the input arrived late. Grow the reserve and re-prime.
+                self.io_stats['buffer_empty'] += 1
+                self.target_latency_samples = min(self._target_max_samples,
+                                                  target + int(self.sample_rate * 0.005))
+                self._in_primed = False
                 return None
 
             if self._src_blk_pre.shape[0] < n_in + 1 or self._src_blk_pre.shape[1] != ch:
@@ -4052,7 +4073,6 @@ class AudioBypass:
         try:
             src_block = self._read_input_block(frames)
             if src_block is None:
-                self.io_stats['buffer_empty'] += 1
                 outdata.fill(0)
                 return
             outdata[:] = self._apply_upmix(src_block, out_ch=outdata.shape[1])

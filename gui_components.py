@@ -383,7 +383,8 @@ class UpmixerWindow(QMainWindow):
         self.lbl_health.setToolTip(
             "Dropout counters since start. When you hear a click, see which one went up:\n"
             "  output late - processing missed the sound card's deadline (CPU / other threads)\n"
-            "  input late - the virtual cable delivered audio late (buffer ran empty)\n"
+            "  input late - the virtual cable delivered audio late (buffer ran empty);\n"
+            "               the input buffer then grows by 5 ms (up to 80 ms) so it stops happening\n"
             "  input overflow / resync - audio arrived faster than it was played\n"
             "  errors - a processing error (the block was silenced)\n"
             "None went up: the click came from before the app (player, virtual cable).")
@@ -1198,7 +1199,8 @@ class UpmixerWindow(QMainWindow):
         if st is not None and hasattr(self, 'lbl_health'):
             errors = getattr(self.audio_app, '_callback_error_count', 0)
             text = (f"AUDIO HEALTH  output late {st['out_underflow']}  ·  input late {st['buffer_empty']}  ·  "
-                    f"input overflow {st['in_overflow']}  ·  resync {st['resync']}  ·  slow blocks {st['slow_blocks']}  ·  errors {errors}")
+                    f"input overflow {st['in_overflow']}  ·  resync {st['resync']}  ·  slow blocks {st['slow_blocks']}  ·  errors {errors}  ·  "
+                    f"input buffer {1000.0 * getattr(self.audio_app, 'target_latency_samples', 0) / max(1, self.audio_app.sample_rate):.0f} ms")
             if text != self.lbl_health.text():
                 self.lbl_health.setText(text)
 

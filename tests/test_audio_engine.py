@@ -440,8 +440,44 @@ def test_audio_health_counters(tmp_path):
         input_overflow = True
         def __bool__(self): return True
         def __str__(self): return "underflow"
-    app.output_callback(out, 480, None, Flags())          # ring buffer empty + device underflow
+    app.output_callback(out, 480, None, Flags())          # startup priming + device underflow
     assert app.io_stats['out_underflow'] == 1
-    assert app.io_stats['buffer_empty'] == 1
-    app.input_callback(np.zeros((480, app.max_input_ch), np.float32), 480, None, Flags())
+    assert app.io_stats['buffer_empty'] == 0              # priming at start is not a dropout
+    app.input_callback(np.zeros((960, app.max_input_ch), np.float32), 960, None, Flags())
     assert app.io_stats['in_overflow'] == 1
+    app.output_callback(out, 480, None, None)             # primed: plays
+    app.output_callback(out, 480, None, None)             # 480 left, fine
+    app.output_callback(out, 480, None, None)             # empty: input late
+    assert app.io_stats['buffer_empty'] == 1
+    assert app.target_latency_samples > int(0.010 * app.sample_rate)
+
+
+def test_input_reserve_grows_until_irregular_delivery_stops_dropping_out(tmp_path):
+    """VB-Cable delivers irregular 256/512-sample chunks: a fixed 10 ms reserve
+    ran dry every few seconds. The reserve grows on each underrun and settles."""
+    app = aa.AudioBypass("CABLE Output", "AVR", simulation=True, config_file=str(tmp_path / "c.json"))
+    rng = np.random.default_rng(0)
+    events, n = [], 0
+    while n < SR * 120:
+        c = int(rng.choice([256, 512], p=[0.89, 0.11])); n += c
+        events.append((n / SR + rng.normal(0, 0.0015), 0, c))
+    t, j = 0.0, 0
+    while True:
+        j += 1; t = 0.02 + j * 480 / SR + abs(rng.normal(0, 0.0015))
+        if t > events[-1][0] - 0.05:
+            break
+        events.append((t, 1, 480))
+    events.sort(key=lambda e: (e[0], e[1]))
+    after_first_minute = None
+    for tt, kind, m in events:
+        if after_first_minute is None and tt > 60:
+            after_first_minute = app.io_stats['buffer_empty']
+        if kind == 0:
+            app.input_callback(np.zeros((m, app.max_input_ch), np.float32), m, None, None)
+        else:
+            app._read_input_block(m)
+    assert app.io_stats['buffer_empty'] - after_first_minute == 0
+    assert app.target_latency_samples <= int(SR * 0.030)
+
+
+SR = 48000
