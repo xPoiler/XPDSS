@@ -378,6 +378,17 @@ class UpmixerWindow(QMainWindow):
         title_lbl.setStyleSheet("color: #00e5ff; font-size: 16px; font-weight: bold; letter-spacing: 1px;")
         main_layout.addWidget(title_lbl)
 
+        self.lbl_health = QLabel("")
+        self.lbl_health.setStyleSheet("color: #777; font-size: 10px;")
+        self.lbl_health.setToolTip(
+            "Dropout counters since start. When you hear a click, see which one went up:\n"
+            "  output late - processing missed the sound card's deadline (CPU / other threads)\n"
+            "  input late - the virtual cable delivered audio late (buffer ran empty)\n"
+            "  input overflow / resync - audio arrived faster than it was played\n"
+            "  errors - a processing error (the block was silenced)\n"
+            "None went up: the click came from before the app (player, virtual cable).")
+        main_layout.addWidget(self.lbl_health)
+
         self.tabs = QTabWidget()
         self.tabs.setStyleSheet("""
             QTabBar::tab { background: #111; color: #888; padding: 10px 20px; font-weight: bold; border: 1px solid #222; }
@@ -1182,6 +1193,14 @@ class UpmixerWindow(QMainWindow):
     def update_gui(self):
         peaks = getattr(self.audio_app, 'last_peaks', [0.0]*8)
         self.radar.set_peaks(peaks)
+
+        st = getattr(self.audio_app, 'io_stats', None)
+        if st is not None and hasattr(self, 'lbl_health'):
+            errors = getattr(self.audio_app, '_callback_error_count', 0)
+            text = (f"AUDIO HEALTH  output late {st['out_underflow']}  ·  input late {st['buffer_empty']}  ·  "
+                    f"input overflow {st['in_overflow']}  ·  resync {st['resync']}  ·  slow blocks {st['slow_blocks']}  ·  errors {errors}")
+            if text != self.lbl_health.text():
+                self.lbl_health.setText(text)
 
         self._update_adaptive_display()
 

@@ -429,3 +429,19 @@ def test_sub_limiter_does_not_pump(engine):
     for k in range(2, 11):                                # normal bass between kicks is untouched
         seg = slice(int(k * 0.25 * SR) + int(0.10 * SR), int(k * 0.25 * SR) + int(0.20 * SR))
         assert np.max(np.abs(y[seg])) == pytest.approx(np.max(np.abs(x[seg])), rel=0.01)
+
+
+def test_audio_health_counters(tmp_path):
+    app = aa.AudioBypass("CABLE Output", "AVR", simulation=True, config_file=str(tmp_path / "c.json"))
+    out = np.zeros((480, 6), dtype=np.float32)
+
+    class Flags:
+        output_underflow = True
+        input_overflow = True
+        def __bool__(self): return True
+        def __str__(self): return "underflow"
+    app.output_callback(out, 480, None, Flags())          # ring buffer empty + device underflow
+    assert app.io_stats['out_underflow'] == 1
+    assert app.io_stats['buffer_empty'] == 1
+    app.input_callback(np.zeros((480, app.max_input_ch), np.float32), 480, None, Flags())
+    assert app.io_stats['in_overflow'] == 1

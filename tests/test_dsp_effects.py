@@ -788,3 +788,39 @@ def test_envelope_follower_matches_reference(att, rel, n_ch):
         ea, zi_a = aa.AudioBypass._asym_env_decimated(x, att, rel, zi_a)
         eb, zi_b = reference(x, att, rel, zi_b)
         assert np.array_equal(ea, eb) and np.array_equal(zi_a, zi_b)
+
+
+@pytest.mark.parametrize("sizes", [[480] * 30 + [128, 352], [441, 442, 448, 480, 300, 1024, 200]])
+def test_tilt_is_smooth_with_variable_block_sizes(engine, sizes):
+    """WASAPI may change the callback size: tilt used to skip small blocks
+    (its 127-sample delay vanished) and reset its EQ on size changes: clicks."""
+    engine.spectral_tilt = True
+    t = np.arange(SR * 2) / SR
+    sig = (0.3 * np.sin(2 * np.pi * 220 * t)).astype(np.float32)
+    x = np.zeros((len(sig), 6), dtype=np.float32)
+    x[:, 0] = x[:, 1] = sig
+    out = x.copy()
+    i = k = 0
+    while i < len(sig):
+        n = sizes[k % len(sizes)]; k += 1
+        engine._apply_spectral_tilt(out[i:i + n], min(n, len(sig) - i), 6)
+        i += n
+    d2 = np.abs(np.diff(out[SR // 2:, 0], 2))
+    assert d2.max() < 0.3 * (2 * np.pi * 220 / SR) ** 2 * 4.0
+
+
+def test_tilt_resumes_after_silence_without_stale_audio(engine):
+    engine.spectral_tilt = True
+    rng = np.random.default_rng(2)
+    blocks = [rng.standard_normal((480, 6)).astype(np.float32) * 0.1 for _ in range(20)]
+    blocks += [np.zeros((480, 6), np.float32) for _ in range(20)]
+    t = np.arange(480 * 5) / SR
+    quiet = np.zeros((480 * 5, 6), np.float32)
+    quiet[:, 0] = 1e-3 * np.sin(2 * np.pi * 300 * t)
+    blocks += [quiet[i:i + 480] for i in range(0, len(quiet), 480)]
+    outs = []
+    for b in blocks:
+        b = b.copy(); engine._apply_spectral_tilt(b, 480, 6); outs.append(b)
+    # when sound resumes, nothing from before the pause may come back out
+    # (the stale 0.1-level noise used to leak through the FIR history)
+    assert np.abs(np.concatenate(outs[40:])).max() < 1e-2

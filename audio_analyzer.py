@@ -144,6 +144,17 @@ class AudioBypass:
         self.exclusive_mode = exclusive_mode
         self.latency = latency
         self.simulation = simulation
+        # Audio health counters (shown in the GUI): which kind of dropout, if
+        # any, happened - output late (processing missed the sound card's
+        # deadline), input overflow, input buffer empty (the virtual cable
+        # delivered late), slow blocks, hard resyncs.
+        self.io_stats = {'out_underflow': 0, 'in_overflow': 0, 'buffer_empty': 0,
+                         'slow_blocks': 0, 'resync': 0}
+        if not simulation:
+            # The audio callbacks are Python: by default another thread (GUI,
+            # analysis) can hold the interpreter for up to 5 ms before the
+            # callback gets to run. 1 ms keeps callbacks on time.
+            sys.setswitchinterval(0.001)
         self.gain = gain
         self.peak_hit = False
         self.start_minimized = start_minimized
@@ -1057,7 +1068,7 @@ class AudioBypass:
         '_sub_period_est', '_sub_need_smooth', '_sub_last_avoid',
         '_vl_voice_mask', '_dlg_bp_sos', '_dlg_bp_zi', '_air_post_zi',
         '_rs_out_pre', '_spectral', '_delay_hist', '_spectral_was_active',
-        '_bass_split_sos', '_amb_shelf_sos', '_cls_stats',
+        '_bass_split_sos', '_amb_shelf_sos', '_cls_stats', '_tilt_mono_hist', '_tilt_taps_designed',
     )
 
     def _reset_dsp_state(self):
@@ -2430,37 +2441,60 @@ class AudioBypass:
             hist[:-frames] = hist[frames:]
             hist[-frames:] = out_block[:frames, :out_ch]
 
+    TILT_FRAME = 480   # analysis frame (samples): fixed, whatever the callback block size
+
     def _apply_spectral_tilt(self, out_block, frames, out_ch):
-        """Adaptive Equalization with Overlap-and-Add Carry Buffers."""
+        """Adaptive Equalization with Overlap-and-Add Carry Buffers.
+
+        Block-size independent: the spectrum is analysed on a fixed frame of
+        the latest TILT_FRAME samples, smoothing runs in time (not per block),
+        and the FIR always runs (its 127-sample delay never comes and goes;
+        variable WASAPI block sizes used to make it click).
+        """
         N = frames
-        if N < 256: return
-        
-        # 1. Compute Mono Contour from All Channels
-        if not hasattr(self, '_tilt_mono_pre') or self._tilt_mono_pre.shape != (N,):
-            self._tilt_mono_pre = np.zeros(N, dtype=np.float32)
-            self._tilt_padded_pre = np.zeros(2 * N, dtype=np.float32)
-            
-        mono = self._tilt_mono_pre
-        mono.fill(0)
-        
-        active = 0
-        for ch in [0, 1, 2, 4, 5]: # FL, FR, C, SL, SR (Skip LFE 3)
-            if ch < out_ch:
-                mono += out_block[:N, ch]
-                active += 1
-        if active > 0:
-            mono /= active
-        
-        padded_mono = self._tilt_padded_pre
+        if N < 1:
+            return
+        A = self.TILT_FRAME
+        k_blocks = N / float(A)           # how many reference blocks this one is worth
+
+        # 1. Mono contour of the latest A samples (FL, FR, C, SL, SR; no LFE)
+        chans = [ch for ch in (0, 1, 2, 4, 5) if ch < out_ch]
+        mono_now = np.zeros(N, dtype=np.float32)
+        for ch in chans:
+            mono_now += out_block[:N, ch]
+        if chans:
+            mono_now /= len(chans)
+        hist = getattr(self, '_tilt_mono_hist', None)
+        if hist is None or hist.shape != (A,):
+            hist = self._tilt_mono_hist = np.zeros(A, dtype=np.float32)
+        if N >= A:
+            hist[:] = mono_now[N - A:]
+        else:
+            hist[:-N] = hist[N:]
+            hist[-N:] = mono_now
+        mono = hist
+
+        padded_mono = getattr(self, '_tilt_padded_pre', None)
+        if padded_mono is None or padded_mono.shape != (2 * A,):
+            padded_mono = self._tilt_padded_pre = np.zeros(2 * A, dtype=np.float32)
         padded_mono.fill(0)
-        padded_mono[:N] = mono
-        
+        padded_mono[:A] = mono
+
         fft_mono = np.fft.rfft(padded_mono)
         mag = np.abs(fft_mono)
-        
-        if np.max(mag) < 1e-6:
-            return
-            
+        silent = np.max(mag) < 1e-6
+
+        if not silent:
+            self._tilt_update_gain(mag, k_blocks)
+        num_taps = 255
+        if self._tilt_taps is None:
+            # nothing analysed yet: a pure delay keeps the timing consistent
+            self._tilt_taps = np.zeros(num_taps)
+            self._tilt_taps[num_taps // 2] = 1.0
+        taps = self._tilt_taps
+        self._tilt_filter_block(out_block, N, out_ch, taps, k_blocks)
+
+    def _tilt_update_gain(self, mag, k_blocks):
         smooth_mag = gaussian_filter1d(mag, sigma=25.0)
         
         # 2. Gain Calculation (Human Preference / Harman-Style Target)
@@ -2496,7 +2530,8 @@ class AudioBypass:
         if prev_gain is None or prev_gain.shape != gain_raw.shape:
             self._tilt_filter_zi['_tilt_gain_smooth'] = gain_raw.copy()
         else:
-            self._tilt_filter_zi['_tilt_gain_smooth'] = prev_gain * 0.995 + gain_raw * 0.005
+            a_s = 0.995 ** k_blocks
+            self._tilt_filter_zi['_tilt_gain_smooth'] = prev_gain * a_s + gain_raw * (1.0 - a_s)
 
         # Prevent treble harshness by tapered maximum boost clamp
         max_gain = np.ones_like(freqs) * 2.0  # Max +6dB absolute boost
@@ -2507,14 +2542,18 @@ class AudioBypass:
 
         gain = np.clip(self._tilt_filter_zi['_tilt_gain_smooth'], 0.3, max_gain)
 
-        # ─── Design FIR taps only every 32 blocks to save CPU ───
+        # ─── Design FIR taps only every 32 reference blocks to save CPU ───
         num_taps = 255
-        if self._tilt_taps is None or self._tilt_update_cnt % 32 == 0:
+        period = 32 * self.TILT_FRAME
+        if self._tilt_taps is None or getattr(self, '_tilt_taps_designed', False) is False or self._tilt_update_cnt >= period:
             norm_freqs = np.linspace(0, 1.0, len(gain))
             self._tilt_taps = firwin2(num_taps, norm_freqs, gain)
-        self._tilt_update_cnt += 1
-        taps = self._tilt_taps
+            self._tilt_taps_designed = True
+            self._tilt_update_cnt = 0 if self._tilt_update_cnt < period else self._tilt_update_cnt - period
+        self._tilt_update_cnt += k_blocks * self.TILT_FRAME
 
+    def _tilt_filter_block(self, out_block, N, out_ch, taps, k_blocks):
+        num_taps = taps.shape[0]
         # 4. Filter ALL channels (the linear-phase FIR delays everything by
         #    127 samples, so every channel must pass through it to stay aligned).
         #    Convolution runs on explicit input history, so swapping taps never
@@ -2540,7 +2579,8 @@ class AudioBypass:
         # against each other (sounds drifting between center and fronts).
         inst_scale = float(np.clip(np.sqrt(energy_in / energy_out), 0.5, 2.0))
         prev_scale = self._tilt_filter_zi.get('tilt_prev_scale', inst_scale)
-        scale_fact = prev_scale * 0.97 + inst_scale * 0.03 if energy_in > 1e-8 else prev_scale
+        a_l = 0.97 ** k_blocks
+        scale_fact = prev_scale * a_l + inst_scale * (1.0 - a_l) if energy_in > 1e-8 else prev_scale
         ramp = np.linspace(prev_scale, scale_fact, N, dtype=np.float32)
         out_block[:N, :out_ch] = filtered_all * ramp[:, None]
         self._tilt_filter_zi['tilt_prev_scale'] = scale_fact
@@ -3354,7 +3394,10 @@ class AudioBypass:
                 self.open_output_stream(self.max_output_ch)
 
     def input_callback(self, indata, frames, time_info, status):
-        if status: print(f"Input Warning: {status}")
+        if status:
+            print(f"Input Warning: {status}")
+            if getattr(status, 'input_overflow', False):
+                self.io_stats['in_overflow'] += 1
         try:
             # Apply gain
             if self.gain != 1.0:
@@ -3972,6 +4015,7 @@ class AudioBypass:
             # the newest audio BEFORE reading, so no stale block is played.
             excess = self.available_samples - frames - target
             if excess > max(2048, 4 * frames):
+                self.io_stats['resync'] += 1
                 self.read_ptr = (self.read_ptr + excess) % size
                 self.available_samples -= excess
                 self._drift_fill_ema = None
@@ -3998,15 +4042,22 @@ class AudioBypass:
         return self._resample_block(raw, frames, rs)
 
     def output_callback(self, outdata, frames, time_info, status):
-        if status: print(f"Output Warning: {status}")
+        if status:
+            print(f"Output Warning: {status}")
+            if getattr(status, 'output_underflow', False):
+                self.io_stats['out_underflow'] += 1
         # Any exception escaping a sounddevice callback stops the stream for
         # good, so every failure is caught here and the block is silenced.
+        t0 = time.perf_counter()
         try:
             src_block = self._read_input_block(frames)
             if src_block is None:
+                self.io_stats['buffer_empty'] += 1
                 outdata.fill(0)
                 return
             outdata[:] = self._apply_upmix(src_block, out_ch=outdata.shape[1])
+            if time.perf_counter() - t0 > frames / float(self.sample_rate):
+                self.io_stats['slow_blocks'] += 1
             if getattr(self, 'secondary_output_enabled', False) and self.secondary_output_stream:
                 self._enqueue_secondary_output_block(self._build_secondary_output_block(outdata, src_block=src_block))
         except Exception as e:
