@@ -33,7 +33,7 @@ class RoomExpander:
         scale = self.sr / 48000.0
         self.delays = np.array([max(64, int(round(d * scale))) for d in _DELAYS_48K])
         self.max_chunk = int(self.delays.min())
-        self.gains = 10.0 ** (-3.0 * self.delays / (rt60 * self.sr))
+        self.set_rt60(rt60)
         self.H = 0.5 * np.array([[1, 1, 1, 1], [1, -1, 1, -1], [1, 1, -1, -1], [1, -1, -1, 1]], dtype=np.float64)
         a = np.exp(-2.0 * np.pi * damping_hz / self.sr)
         self.damp_b, self.damp_a = np.array([1.0 - a]), np.array([1.0, -a])
@@ -41,6 +41,11 @@ class RoomExpander:
         self.in_sos = butter(2, [200.0 / (self.sr / 2), min(0.95, 8000.0 / (self.sr / 2))], btype='band', output='sos')
         self.predelay = int(predelay_ms * self.sr / 1000.0)
         self.reset()
+
+    def set_rt60(self, rt60: float) -> None:
+        """Change the decay time on the fly (no reset, no click)."""
+        self.rt60 = float(rt60)
+        self.gains = 10.0 ** (-3.0 * self.delays / (self.rt60 * self.sr))
 
     def reset(self) -> None:
         self.buf_len = int(self.delays.max()) + self.max_chunk + 1

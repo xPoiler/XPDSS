@@ -1075,7 +1075,7 @@ class AudioBypass:
         '_sub_period_est', '_sub_need_smooth', '_sub_last_avoid',
         '_vl_voice_mask', '_dlg_bp_sos', '_dlg_bp_zi', '_air_post_zi',
         '_rs_out_pre', '_spectral', '_delay_hist', '_spectral_was_active',
-        '_bass_split_sos', '_amb_shelf_sos', '_cls_stats', '_lf_decorr_states', '_room_expander', '_tilt_mono_hist', '_tilt_taps_designed',
+        '_bass_split_sos', '_amb_shelf_sos', '_cls_stats', '_lf_decorr_states', '_room_expander', '_ctr_eq_sos', '_tilt_mono_hist', '_tilt_taps_designed',
     )
 
     def _reset_dsp_state(self):
@@ -3632,9 +3632,58 @@ class AudioBypass:
         self._apply_post_effects(out_block, out_ch, skip_subsynth=force_passthrough,
                                  src_block=src_block, is_passthrough=is_passthrough)
 
+        # Phantom-matched centre (upmix only: the centre then holds moved content)
+        if out_ch > 2 and not is_passthrough:
+            self._apply_center_match(out_block)
+
         # Output headroom, then the peak limiter (all channels)
         self._apply_output_headroom(out_block)
         return self._apply_true_peak_limiter(out_block)
+
+    @staticmethod
+    def _rbj(kind, f0, gain_db, q, sr):
+        A = 10 ** (gain_db / 40.0)
+        w0 = 2 * math.pi * f0 / sr
+        cw, sw = math.cos(w0), math.sin(w0)
+        alpha = sw / (2 * q)
+        if kind == 'peak':
+            b = [1 + alpha * A, -2 * cw, 1 - alpha * A]
+            a = [1 + alpha / A, -2 * cw, 1 - alpha / A]
+        else:   # low shelf
+            sa = 2 * math.sqrt(A) * alpha
+            b = [A * ((A + 1) - (A - 1) * cw + sa), 2 * A * ((A - 1) - (A + 1) * cw), A * ((A + 1) - (A - 1) * cw - sa)]
+            a = [(A + 1) + (A - 1) * cw + sa, -2 * ((A - 1) + (A + 1) * cw), (A + 1) + (A - 1) * cw - sa]
+        return np.array([b[0] / a[0], b[1] / a[0], b[2] / a[0], 1.0, a[1] / a[0], a[2] / a[0]])
+
+    def _apply_center_match(self, out_block):
+        """PHANTOM-MATCHED CENTRE: give the real centre the tonal balance the
+        sound had as a phantom between L and R, which is how the mix was made.
+
+        A phantom centre adds coherently at the ears in the low mids (~+2.5 dB
+        of body vs one speaker at the same power) and has a comb dip around
+        1.2-2 kHz; a real centre has neither, so moved voices and instruments
+        sound forward and lean. Head models (Brown-Duda and a simple shadow
+        model) agree on the shape: +2 dB low shelf at 500 Hz and a broad
+        -2.5 dB dip at 1.5 kHz (about half the free-field dip: in a room,
+        reflections fill much of it). Crossfaded on switching.
+        """
+        r = None
+        target = 1.0 if getattr(self, 'center_match', False) else 0.0
+        if not hasattr(self, '_last_ctr_eq'):
+            self._last_ctr_eq = 0.0
+        if self._last_ctr_eq == 0.0 and target == 0.0:
+            return
+        r = self._get_ramp('_last_ctr_eq', target, out_block.shape[0])
+        sos = getattr(self, '_ctr_eq_sos', None)
+        if sos is None or getattr(self, '_ctr_eq_sr', None) != self.sample_rate:
+            sr = self.sample_rate
+            sos = self._ctr_eq_sos = np.stack([self._rbj('shelf', 500.0, 2.0, 0.7, sr),
+                                               self._rbj('peak', 1500.0, -2.5, 0.9, sr)])
+            self._ctr_eq_sr = self.sample_rate
+            self._ctr_eq_zi = np.zeros((2, 2))
+        c = out_block[:, 2].astype(np.float64)
+        y, self._ctr_eq_zi = sosfilt(sos, c, zi=self._ctr_eq_zi)
+        out_block[:, 2] = (c + r * (y - c)).astype(np.float32)
 
     def _apply_output_headroom(self, out_block):
         gain = 10.0 ** (-max(0.0, float(getattr(self, 'output_headroom_db', 0.0))) / 20.0)
@@ -3691,7 +3740,8 @@ class AudioBypass:
             split_sides_backs=out_ch >= 8,
             envelopment=getattr(self, 'envelopment', 0.0),
             wrap=getattr(self, 'wrap_amount', 0.0),
-            hard_pan_sides=bool(getattr(self, 'hard_pan_sides', False))).astype(np.float32)
+            hard_pan_sides=bool(getattr(self, 'hard_pan_sides', False)),
+            wide_sides=bool(getattr(self, 'wide_stereo_sides', False))).astype(np.float32)
         self._spec_delayed_src = self._delay_block('spec_src', src_block, engine.latency)
 
     def _route_spectral(self, out_block, out_ch):
@@ -3817,7 +3867,13 @@ class AudioBypass:
         out[:, 1] = mid_gain * mid - side_gain * side
         return out
 
-    ROOM_LEVEL = 0.25   # room expansion level per surround (IMMERSIVE): late field ~13 dB under a dry source
+    ROOM_LEVEL = 0.25   # room expansion level per surround at Room 50 % (late field ~13 dB under a dry source)
+
+    def _room_params(self):
+        """Room slider (0..1): level and decay of the room expansion.
+        50 % = 0.25 level / 1.0 s; 100 % = 0.5 level / 1.6 s (a bigger hall)."""
+        amount = float(np.clip(getattr(self, 'room_amount', 0.5), 0.0, 1.0))
+        return self.ROOM_LEVEL * 2.0 * amount, 0.4 + 1.2 * amount
 
     def _immersive_ramp(self, key, frames):
         """0..1 ramp for IMMERSIVE parts (None when fully off): switching
@@ -3851,12 +3907,15 @@ class AudioBypass:
                 return
         else:
             self._room_idle = 0
+        level, rt60 = self._room_params()
         if rx is None or rx.sr != self.sample_rate:
-            rx = self._room_expander = RoomExpander(self.sample_rate)
+            rx = self._room_expander = RoomExpander(self.sample_rate, rt60=rt60)
+        elif abs(rx.rt60 - rt60) > 1e-3:
+            rx.set_rt60(rt60)
         g_in = self._get_ramp('_last_room_in', 1.0 if on else 0.0, frames)
         targets = [4, 5] if out_ch < 8 else [6, 7, 4, 5]
         tail = rx.process(mono * g_in, len(targets))
-        g_out = self.ROOM_LEVEL * 10 ** (self.side_gain_db / 20.0)
+        g_out = level * 10 ** (self.side_gain_db / 20.0)
         for k, ch in enumerate(targets):
             w = 0.7 if (out_ch >= 8 and ch in (4, 5)) else 1.0
             out_block[:, ch] += (tail[:, k] * (g_out * w)).astype(np.float32)

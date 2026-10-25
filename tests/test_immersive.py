@@ -77,3 +77,33 @@ def test_hard_pans_go_to_the_side_surround():
     centre = np.stack([s, s], axis=1)
     out = np.concatenate([up.process(centre[i:i + 480], hard_pan_sides=True) for i in range(0, len(x), 480)])[SR:]
     assert (out[:, SIDE_L] ** 2).sum() < 1e-6 * (out ** 2).sum()
+
+
+def test_wide_stereo_goes_to_the_sides_but_in_phase_sources_stay_in_front():
+    from scipy.signal import hilbert
+    rng = np.random.default_rng(3)
+    s = rng.standard_normal(SR * 3) * 0.1
+    h = np.imag(hilbert(s))
+    side = lambda out: (out[:, SIDE_L] ** 2 + out[:, SIDE_L + 1] ** 2).sum()
+    for deg, expect_side in ((0, False), (110, True)):
+        ph = np.radians(deg)
+        x = np.stack([s, np.cos(ph) * s + np.sin(ph) * h], axis=1)
+        up = SpectralUpmixer(SR)
+        out = np.concatenate([up.process(x[i:i + 480], wide_sides=True) for i in range(0, len(x), 480)])[SR:]
+        frac = side(out) / (out ** 2).sum()
+        assert (frac > 0.5) if expect_side else (frac < 1e-4)
+
+
+def test_centre_match_is_crossfaded_and_shapes_the_centre(tmp_path):
+    e = _engine(tmp_path, spectral_upmix=False)
+    rng = np.random.default_rng(4)
+    blk = np.zeros((48000, 6), np.float32); blk[:, 2] = rng.standard_normal(48000) * 0.1
+    e.center_match = True
+    out = blk.copy()
+    for i in range(0, len(out), 480):
+        e._apply_center_match(out[i:i + 480])
+    f = np.fft.rfftfreq(8192, 1 / SR)
+    spec = lambda x: np.abs(np.fft.rfft(x[-8192:]))
+    ratio = 20 * np.log10(np.convolve(spec(out[:, 2]) / spec(blk[:, 2]), np.ones(64) / 64, 'same'))
+    assert np.interp(300, f, ratio) > 1.0 and np.interp(1500, f, ratio) < -1.5
+    assert e._last_ctr_eq == 1.0

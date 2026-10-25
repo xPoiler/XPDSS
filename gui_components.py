@@ -517,6 +517,15 @@ class UpmixerWindow(QMainWindow):
                  "Spectral upmix: sounds panned hard left/right in the mix play from the\n"
                  "side surrounds instead of the fronts (from ~60% pan it moves outward,\n"
                  "fully at ~95%). Centre and half-panned sources stay in front."),
+                ("WIDE STEREO → SIDES", "wide_stereo_sides",
+                 "Spectral upmix: stereo-widened sounds (chorused guitars, wide synths,\n"
+                 "stereo FX: left/right partly out of phase) play from the side surrounds\n"
+                 "as sounds beside you, instead of a front / ambience wash."),
+                ("CENTRE MATCH", "center_match",
+                 "Phantom-matched centre: a real centre speaker lacks the low-mid body and\n"
+                 "the ~1.5 kHz dip a phantom centre has at the ears, so voices moved there\n"
+                 "sound forward and lean. This restores the tonal balance of the mix\n"
+                 "(+2 dB low shelf at 500 Hz, -2.5 dB at 1.5 kHz on the centre)."),
                 ("STAGE EQUALIZER", "stage_equalizer", "Balance front/surround weight."),
                 ("CENTER FOCUS", "center_extraction", "Extract dialogue to center speaker."),
                 ("CINEMA STEERING", "cinema_steering",
@@ -616,6 +625,12 @@ class UpmixerWindow(QMainWindow):
                                  "100% = a hard-panned source sits halfway between front and surround.")
         self.sld_wrap.valueChanged.connect(lambda v: (setattr(self.audio_app, "wrap_amount", v / 100.0), self.request_save()))
         right_panel.addWidget(self.sld_wrap)
+
+        self.sld_room_amount = LabeledSlider("Room (Immersive)", 0.0, 100.0, getattr(audio_app, 'room_amount', 0.5) * 100.0, suffix="%", is_int=True)
+        self.sld_room_amount.setToolTip("IMMERSIVE room expansion: level and size of the late field\n"
+                                        "(50% = ~1 s, 100% = bigger hall ~1.6 s and +6 dB).")
+        self.sld_room_amount.valueChanged.connect(lambda v: (setattr(self.audio_app, "room_amount", v / 100.0), self.request_save()))
+        right_panel.addWidget(self.sld_room_amount)
 
         self.sld_sub_gain = LabeledSlider("Sub Gain", 0.0, 5.0, audio_app.sub_gain, suffix="x")
         self.sld_sub_gain.valueChanged.connect(lambda v: (setattr(self.audio_app, "sub_gain", v), self.request_save()))
@@ -936,6 +951,7 @@ class UpmixerWindow(QMainWindow):
             'sld_width': ('width_factor', None),
             'sld_envelopment': ('envelopment', lambda v: v * 100.0),
             'sld_wrap': ('wrap_amount', lambda v: v * 100.0),
+            'sld_room_amount': ('room_amount', lambda v: v * 100.0),
             'sld_sub_gain': ('sub_gain', None),
             'sld_sub_low': ('sub_low_cutoff', None),
             'sld_sub_cutoff': ('sub_drive_cutoff', None),
@@ -1011,7 +1027,7 @@ class UpmixerWindow(QMainWindow):
             for b in self.option_buttons.values():
                 b.setDisabled(is_bypass)
 
-        all_sliders = ['sld_spread', 'sld_width', 'sld_side_gain', 'sld_envelopment', 'sld_wrap', 'sld_sub_gain', 'sld_sub_cutoff',
+        all_sliders = ['sld_spread', 'sld_width', 'sld_side_gain', 'sld_envelopment', 'sld_wrap', 'sld_room_amount', 'sld_sub_gain', 'sld_sub_cutoff',
                        'sld_sub_low', 'sld_transient', 'sld_micro_dyn', 'sld_clarity', 'sld_room_mix', 'sld_air',
                        'sld_trans_delay', 'sld_trans_gain', 'sld_trans_feedback',
                        'sld_speaker_width', 'sld_camera_fov', 'sld_speaker_dist', 'sld_room_width']
@@ -1043,8 +1059,11 @@ class UpmixerWindow(QMainWindow):
         for name in ('sld_envelopment', 'sld_wrap'):
             if hasattr(self, name):
                 getattr(self, name).setDisabled(not is_spectral or is_stereo)
-        if 'hard_pan_sides' in self.option_buttons:
-            self.option_buttons['hard_pan_sides'].setEnabled(is_spectral and not is_stereo)
+        for key in ('hard_pan_sides', 'wide_stereo_sides'):
+            if key in self.option_buttons:
+                self.option_buttons[key].setEnabled(is_spectral and not is_stereo)
+        if hasattr(self, 'sld_room_amount'):
+            self.sld_room_amount.setDisabled(not getattr(app, 'immersive', False) or is_stereo)
         if 'immersive' in self.option_buttons:
             self.option_buttons['immersive'].setEnabled(not is_stereo)
 
@@ -1066,7 +1085,7 @@ class UpmixerWindow(QMainWindow):
         # 4. Mode-exclusive visibility
         speaker_only = ['transaural_widening', 'cinema_steering', 'gaming_panning', 'stage_equalizer', 'spectral_upmix',
                         'head_tracking', 'center_extraction', 'lfe_muted', 'vocal_lock', 'freq_dep_width',
-                        'immersive', 'hard_pan_sides']
+                        'immersive', 'hard_pan_sides', 'wide_stereo_sides', 'center_match']
         headphone_only = ['head_shadow_eq', 'headphone_tracking', 'hp_externalization']
 
         for f in speaker_only:

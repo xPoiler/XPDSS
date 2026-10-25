@@ -126,7 +126,8 @@ class SpectralUpmixer:
     # ── streaming ─────────────────────────────────────────────────────
     def process(self, stereo: np.ndarray, center_spread: float = 0.0, width: float = 1.0,
                 center: bool = True, steering: int = STEER_OFF, split_sides_backs: bool = False,
-                envelopment: float = 0.0, wrap: float = 0.0, hard_pan_sides: bool = False) -> np.ndarray:
+                envelopment: float = 0.0, wrap: float = 0.0, hard_pan_sides: bool = False,
+                wide_sides: bool = False) -> np.ndarray:
         """Feed (frames, 2) samples, get (frames, N_STREAMS) streams delayed by `latency`.
 
         Streams: direct L/R/C (front stage), ambient L/R, and the steered
@@ -140,6 +141,9 @@ class SpectralUpmixer:
         side surrounds (SIDE_L/R streams), like a wider front stage.
         hard_pan_sides: sources panned (nearly) hard left/right play from the
         side surrounds instead of the fronts (ramp from 60 % to 95 % pan).
+        wide_sides: stereo-widened sources (L/R partly out of phase, 45-120
+        degrees: chorused guitars, wide synths, stereo FX) play from the side
+        surrounds as sources instead of becoming front / ambience wash.
         """
         frames = stereo.shape[0]
         spread = 1.0 if not center else float(np.clip(center_spread, 0.0, 1.0))
@@ -156,7 +160,7 @@ class SpectralUpmixer:
         if frame_list:
             ys = self._process_frame(np.stack(frame_list), spread, float(width), int(steering), bool(split_sides_backs),
                                      float(np.clip(envelopment, 0.0, 1.0)), float(np.clip(wrap, 0.0, 1.0)),
-                                     bool(hard_pan_sides))
+                                     bool(hard_pan_sides), bool(wide_sides))
             for y in ys:
                 self._ola += y
                 produced.append(self._ola[:self.hop].copy())
@@ -170,7 +174,8 @@ class SpectralUpmixer:
     # ── STFT frames ───────────────────────────────────────────────────
     def _process_frame(self, frames: np.ndarray, spread: float, width: float,
                        steering: int = STEER_OFF, split: bool = False,
-                       envelopment: float = 0.0, wrap: float = 0.0, hard_sides: bool = False) -> np.ndarray:
+                       envelopment: float = 0.0, wrap: float = 0.0, hard_sides: bool = False,
+                       wide_sides: bool = False) -> np.ndarray:
         """frames: (F, n, 2) consecutive analysis frames -> (F, n, N_STREAMS)."""
         X = np.fft.rfft(frames * self.win[None, :, None], axis=1).astype(np.complex64)
         L, R = X[..., 0], X[..., 1]                       # (F, bins)
@@ -360,6 +365,21 @@ class SpectralUpmixer:
             side_r = sw * out_r
             out_l = cw * out_l
             out_r = cw * out_r
+        if wide_sides:
+            # Stereo-widened direct sources (inter-channel phase 45-120 deg)
+            # move from the front stage to the side surrounds (constant power),
+            # left/right by their panning; centred wide sources become a
+            # phantom between the two side surrounds. Coherent sources only
+            # (confidence), so reverb and room stay ambience.
+            phase = np.degrees(np.arccos(np.clip(cos_phase, -1.0, 1.0)))
+            amt = np.clip((phase - 45.0) / 75.0, 0.0, 1.0) * confidence * w
+            amt = np.where(np.minimum(a1, a2) < 1e-6, 0.0, amt)
+            psi = amt * (math.pi / 2)
+            cps, sps = np.cos(psi), np.sin(psi)
+            c_share = out_c * (sps * math.sqrt(0.5))
+            side_l = side_l + sps * out_l + c_share
+            side_r = side_r + sps * out_r + c_share
+            out_l, out_r, out_c = cps * out_l, cps * out_r, cps * out_c
         if steering != STEER_OFF:
             # Rear point source, panned left/right by its position (constant power)
             th = (pan + 1.0) * (math.pi / 4)
@@ -402,7 +422,7 @@ class SpectralUpmixer:
         # Only synthesise the streams in use (the rear ones are silent unless
         # steering is on; the backs only on 7.1)
         active = list(range(AMBIENT_R + 1))
-        if steering != STEER_OFF or wrap > 0.0 or hard_sides:
+        if steering != STEER_OFF or wrap > 0.0 or hard_sides or wide_sides:
             active += [SIDE_L, SIDE_R]
         if steering != STEER_OFF and split:
             active += [BACK_L, BACK_R]
