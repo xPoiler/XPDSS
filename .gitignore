@@ -13,3 +13,4 @@ config.json.tmp
 config.json.corrupt
 .pytest_cache/
 models/
+*.npy
