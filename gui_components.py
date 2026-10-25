@@ -80,6 +80,8 @@ class HaloPanningWidget(QFrame):
         self.is_dragging = False
         self.last_peaks = [0.0] * 8
         self.independent_panning = False
+        self.setToolTip("Drag the dot: up = ambience in the fronts, down = ambience in the surrounds\n"
+                        "(middle = shared). Only the dot can be grabbed; double-click to re-center.")
 
         self.color_cyan = QColor(0, 195, 255)
         self.color_bg = QColor(15, 15, 15)
@@ -188,10 +190,28 @@ class HaloPanningWidget(QFrame):
                 painter.setPen(Qt.white if is_enabled else QColor(160, 160, 160))
                 painter.drawText(QRectF(lx-15, ly-15, 30, 30), Qt.AlignCenter, text)
 
+    GRAB_RADIUS_PX = 22
+
+    def _puck_screen_pos(self):
+        w, h = self.width(), self.height()
+        radius = min(w, h) / 2 - 40
+        return QPointF(w / 2 + self.puck_pos.x() * radius, h / 2 - self.puck_pos.y() * radius)
+
     def mousePressEvent(self, event):
+        # Only a press on the dot starts a drag: a stray click anywhere on the
+        # radar used to jump it (e.g. below the circle -> Y = -1, all front
+        # ambience moved to the surrounds without the user noticing).
         if event.button() == Qt.LeftButton:
-            self.is_dragging = True
-            self.update_puck_from_mouse(event.position())
+            d = event.position() - self._puck_screen_pos()
+            if math.hypot(d.x(), d.y()) <= self.GRAB_RADIUS_PX:
+                self.is_dragging = True
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.is_dragging = False
+            self.puck_pos = QPointF(0.0, 0.0)
+            self.panningChanged.emit(0.0, 0.0)
+            self.update()
 
     def mouseMoveEvent(self, event):
         if self.is_dragging:
@@ -540,6 +560,14 @@ class UpmixerWindow(QMainWindow):
         # ══════════════════════════════════════════════════════════════
         right_panel.addWidget(_make_section_label("PARAMETERS"))
 
+        self.sld_headroom = LabeledSlider("Output Headroom", 0.0, 12.0, getattr(audio_app, 'output_headroom_db', 4.0), suffix=" dB")
+        self.sld_headroom.setToolTip("Lowers every output channel equally (all modes, bypass included) so an\n"
+                                     "upmixed center fits without the limiter ducking the whole mix.\n"
+                                     "Sub/mains balance and passthrough/upmix match are unchanged:\n"
+                                     "raise the AVR volume by the same amount once.")
+        self.sld_headroom.valueChanged.connect(lambda v: (setattr(self.audio_app, "output_headroom_db", v), self.request_save()))
+        right_panel.addWidget(self.sld_headroom)
+
         self.sld_spread = LabeledSlider("Center Spread", 0.0, 100.0, audio_app.center_spread * 100.0, suffix="%", is_int=True)
         self.sld_spread.valueChanged.connect(lambda v: (setattr(self.audio_app, "center_spread", v / 100.0), self.request_save()))
         right_panel.addWidget(self.sld_spread)
@@ -866,6 +894,7 @@ class UpmixerWindow(QMainWindow):
 
         sliders_map = {
             'sld_spread': ('center_spread', lambda v: v * 100.0),
+            'sld_headroom': ('output_headroom_db', None),
             'sld_side_gain': ('side_gain_db', None),
             'sld_width': ('width_factor', None),
             'sld_sub_gain': ('sub_gain', None),

@@ -257,6 +257,12 @@ class AudioBypass:
 
         self.dyn_eq_level = 0.0 # Track master volume smoothed (Dynamic EQ)
         self.bypass_all = False
+        # Output headroom (dB, global): every channel in every mode (bypass
+        # included) leaves this much lower, so the center of an upmixed loud
+        # master fits without the limiter ducking everything. Same cut for
+        # all channels: the LFE/mains balance and the passthrough/upmix match
+        # are unchanged; raise the AVR volume once instead.
+        self.output_headroom_db = 4.0
 
         self.correlation_smooth = 0.0 # 0.0 (Wide) to 1.0 (Mono)
 
@@ -1621,17 +1627,20 @@ class AudioBypass:
         is still applied to the current (post-micro-dyn) block.
         """
         sr = self.sample_rate
-        n_ch = block.shape[1]
         n_samp = block.shape[0]
 
-        # Use reference block for envelope detection if available
+        # Use reference block for envelope detection if available. Detection
+        # is linked across channels (peak of all of them) and one gain is
+        # applied to every channel: per-channel gains moved sounds between
+        # the speakers on every hit (the center and the fronts boosted at
+        # different moments).
         detect = ref_block if ref_block is not None else block
-        abs_block = np.abs(detect).astype(np.float64)
+        abs_block = np.max(np.abs(detect), axis=1, keepdims=True).astype(np.float64)
 
-        if not hasattr(self, '_tr_fast_zi') or self._tr_fast_zi.shape[1] != n_ch:
-            self._tr_fast_zi = np.zeros((1, n_ch), dtype=np.float64)
-            self._tr_slow_zi = np.zeros((1, n_ch), dtype=np.float64)
-            self._tr_gain_zi = np.ones((1, n_ch), dtype=np.float64)
+        if not hasattr(self, '_tr_fast_zi') or self._tr_fast_zi.shape[1] != 1:
+            self._tr_fast_zi = np.zeros((1, 1), dtype=np.float64)
+            self._tr_slow_zi = np.zeros((1, 1), dtype=np.float64)
+            self._tr_gain_zi = np.ones((1, 1), dtype=np.float64)
 
         # Two envelopes with MATCHED release but different attack times.
         fast_att = np.exp(-1.0 / (sr * 0.0005))  # 0.5ms
@@ -1723,7 +1732,9 @@ class AudioBypass:
         the sustain/decay portions that modern loudness-war masters crush.
         """
         sr = self.sample_rate
-        n_samp, n_ch = block.shape
+        n_samp = block.shape[0]
+        n_ch = 1   # linked: one level and one gain for all channels (per-channel
+                   # gains pumped the quieter surrounds against the fronts)
         if n_samp < 64:
             return
 
@@ -1736,7 +1747,7 @@ class AudioBypass:
             self._ud_initialized = False
 
         # ── Per-channel block RMS in dB ──
-        rms = np.sqrt(np.mean(block.astype(np.float64) ** 2, axis=0) + 1e-12)
+        rms = np.sqrt(np.atleast_1d(np.mean(block.astype(np.float64) ** 2) * block.shape[1]) + 1e-12)
         block_db = 20.0 * np.log10(rms + 1e-12)
 
         # ── Update long-term reference (5s EMA) ──
@@ -2090,10 +2101,8 @@ class AudioBypass:
         # ── Program Level Estimator (always runs, measures only) ──
         self._update_program_level(out_block)
 
-        # ── Input Restoration (runs first, fixes damaged source) ──
-        # #19 Declipping
-        if getattr(self, 'declip', False):
-            self._apply_declip(out_block)
+        # (#19 Declipping runs on the input, see _apply_upmix: after the upmix a
+        # center above 0.99 is legitimate, not clipping)
 
         # #17 Loudness Normalization (AGC)
         if getattr(self, 'loudness_norm', False):
@@ -2461,26 +2470,27 @@ class AudioBypass:
         if not hasattr(self, '_tilt_hist') or self._tilt_hist.shape != (hist_len, out_ch):
             self._tilt_hist = np.zeros((hist_len, out_ch), dtype=np.float32)
 
+        filtered_all = np.empty((N, out_ch), dtype=np.float32)
+        energy_in = energy_out = 1e-12
         for ch in range(out_ch):
             sig = out_block[:N, ch].copy()
             ext = np.concatenate((self._tilt_hist[:, ch], sig))
             self._tilt_hist[:, ch] = ext[-hist_len:]
-            filtered = np.convolve(ext, taps, mode='valid')[:N]
+            filtered_all[:, ch] = np.convolve(ext, taps, mode='valid')[:N]
+            if ch != 3:
+                energy_in += float(np.sum(sig ** 2))
+                energy_out += float(np.sum(filtered_all[:, ch].astype(np.float64) ** 2))
 
-            # Slow level lock: compensates the EQ's overall gain without
-            # block-rate pumping (heavily smoothed, limited to +/-6 dB).
-            energy_in = float(np.sum(sig ** 2)) + 1e-12
-            energy_out = float(np.sum(filtered ** 2)) + 1e-12
-            inst_scale = float(np.clip(np.sqrt(energy_in / energy_out), 0.5, 2.0))
-            key_scale = f'tilt_prev_scale_{ch}'
-            prev_scale = self._tilt_filter_zi.get(key_scale, inst_scale)
-            if energy_in > 1e-8:
-                scale_fact = prev_scale * 0.97 + inst_scale * 0.03
-            else:
-                scale_fact = prev_scale
-            ramp = np.linspace(prev_scale, scale_fact, N, dtype=np.float32)
-            out_block[:N, ch] = filtered.astype(np.float32) * ramp
-            self._tilt_filter_zi[key_scale] = scale_fact
+        # Slow level lock: compensates the EQ's overall gain without
+        # block-rate pumping (heavily smoothed, limited to +/-6 dB). One scale
+        # for all channels: per-channel scales re-balanced the speakers
+        # against each other (sounds drifting between center and fronts).
+        inst_scale = float(np.clip(np.sqrt(energy_in / energy_out), 0.5, 2.0))
+        prev_scale = self._tilt_filter_zi.get('tilt_prev_scale', inst_scale)
+        scale_fact = prev_scale * 0.97 + inst_scale * 0.03 if energy_in > 1e-8 else prev_scale
+        ramp = np.linspace(prev_scale, scale_fact, N, dtype=np.float32)
+        out_block[:N, :out_ch] = filtered_all * ramp[:, None]
+        self._tilt_filter_zi['tilt_prev_scale'] = scale_fact
 
     def _apply_subharmonic_synth(self, out_block, frames, out_ch, src_block=None):
         """Generate clean subharmonic (f/2) via autocorrelation pitch tracking + sine oscillator."""
@@ -2989,6 +2999,7 @@ class AudioBypass:
             "webcam_device": getattr(self, "webcam_name", ""),
             "webcam_index": getattr(self, "webcam_index", 0),
             "bypass_all": getattr(self, "bypass_all", False),
+            "output_headroom_db": float(getattr(self, "output_headroom_db", 4.0)),
             "secondary_output": secondary_output_state,
             **adaptive_state,
         }
@@ -3034,6 +3045,10 @@ class AudioBypass:
                 self.webcam_name = data.get("webcam_device", getattr(self, "webcam_name", ""))
                 self.webcam_index = data.get("webcam_index", getattr(self, "webcam_index", 0))
             self.bypass_all = data.get("bypass_all", getattr(self, "bypass_all", False))
+            try:
+                self.output_headroom_db = max(0.0, min(12.0, float(data.get("output_headroom_db", getattr(self, "output_headroom_db", 4.0)))))
+            except (TypeError, ValueError):
+                self.output_headroom_db = 4.0
             apply_adaptive_state_to_object(self, {k: v for k, v in data.items() if k in build_adaptive_state_from_object(self)})
 
             secondary_output_state = data.get("secondary_output", {})
@@ -3061,7 +3076,7 @@ class AudioBypass:
             if "upmix_enabled" in data and not self.speakers_config:
                 legacy_excluded = {
                     "current_mode", "speakers", "headphones", "input_device", "output_device",
-                    "webcam_device", "webcam_index", "bypass_all", "adaptive_enabled", "adaptive_monitor_enabled",
+                    "webcam_device", "webcam_index", "bypass_all", "output_headroom_db", "adaptive_enabled", "adaptive_monitor_enabled",
                     "adaptive_observe_only", "adaptive_mode", "adaptive_profile", "adaptive_compare_bypass",
                     "secondary_output", "secondary_output_enabled", "secondary_output_device",
                     "secondary_output_gain_db", "secondary_output_lowpass_hz", "secondary_output_highpass_hz",
@@ -3386,7 +3401,14 @@ class AudioBypass:
             limit = min(src_block.shape[1], out_ch)
             out_block[:, :limit] = src_block[:, :limit]
             self._downmix_extra_channels(src_block, out_block, out_ch)
+            self._apply_output_headroom(out_block)
             return out_block
+
+        # Declipping repairs the source, so it runs on the input: only there is
+        # a flat run at full scale really clipping.
+        if getattr(self, 'declip', False):
+            src_block = src_block.copy()
+            self._apply_declip(src_block)
 
         # 1. Passthrough: real multichannel detected, stereo output, or upmix off
         force_passthrough = self.is_multichannel_detected and not self.manual_upmix
@@ -3479,8 +3501,14 @@ class AudioBypass:
         self._apply_post_effects(out_block, out_ch, skip_subsynth=force_passthrough,
                                  src_block=src_block, is_passthrough=is_passthrough)
 
-        # Output peak limiter (all channels)
+        # Output headroom, then the peak limiter (all channels)
+        self._apply_output_headroom(out_block)
         return self._apply_true_peak_limiter(out_block)
+
+    def _apply_output_headroom(self, out_block):
+        gain = 10.0 ** (-max(0.0, float(getattr(self, 'output_headroom_db', 0.0))) / 20.0)
+        if gain != 1.0 or getattr(self, '_last_headroom', 1.0) != 1.0:
+            out_block *= self._get_ramp('_last_headroom', gain, out_block.shape[0])[:, np.newaxis]
 
     def _route(self, mode, src_block, out_block, out_ch):
         if mode == 'pass':

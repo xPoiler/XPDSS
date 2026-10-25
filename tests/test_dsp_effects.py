@@ -664,3 +664,67 @@ def test_virtual_room_reflections_only_on_surrounds(engine):
         assert rms_db(out[tail, ch]) > -50  # input -20 dB, reflections ~-14..-22 dB under it
     # sides (early reflections) louder than backs (later ones)
     assert rms_db(out[tail, 6]) > rms_db(out[tail, 4])
+
+
+@pytest.mark.headroom
+@pytest.mark.parametrize("bypass", [False, True])
+def test_output_headroom_lowers_every_channel_equally(tmp_path, bypass):
+    app = aa.AudioBypass("CABLE Output", "AVR", simulation=True, config_file=str(tmp_path / "c.json"))
+    app.current_channels = 8
+    app.is_multichannel_detected = False
+    assert app.output_headroom_db == 4.0
+    configure_upmix(app)
+    app.bypass_all = bypass
+    s = tone(1000, 0.5)
+    src = src8(s, s)
+    src[:, 2:] = tone(500, 0.5)[:, None] * np.ones(6, dtype=np.float32)   # so bypass has every channel
+    ref_app = aa.AudioBypass("CABLE Output", "AVR", simulation=True, config_file=str(tmp_path / "r.json"))
+    ref_app.current_channels = 8
+    ref_app.is_multichannel_detected = False
+    configure_upmix(ref_app)
+    ref_app.bypass_all = bypass
+    ref_app.output_headroom_db = 0.0
+    out, ref = upmix(app, src.copy()), upmix(ref_app, src.copy())
+    tail = slice(SR // 4, SR // 2)
+    for ch in range(8):
+        if rms_db(ref[tail, ch]) > -60:
+            assert rms_db(out[tail, ch]) - rms_db(ref[tail, ch]) == pytest.approx(-4.0, abs=0.05)
+
+
+def test_output_headroom_is_saved(tmp_path):
+    cfg = str(tmp_path / "c.json")
+    app = aa.AudioBypass("CABLE Output", "AVR", simulation=True, config_file=cfg)
+    app.output_headroom_db = 6.0
+    app.save_config()
+    again = aa.AudioBypass("CABLE Output", "AVR", simulation=True, config_file=cfg)
+    again.load_config()
+    assert again.output_headroom_db == 6.0
+
+
+@pytest.mark.parametrize("effect", ["transient_restore", "micro_dynamics"])
+def test_dynamics_are_linked_so_sounds_do_not_move(engine, effect):
+    """One gain for every channel: a drum hit in the center must not turn the
+    fronts up or down relative to it (per-channel gains moved the image)."""
+    rng = np.random.default_rng(11)
+    n = SR * 2
+    x = np.zeros((n, 6), dtype=np.float32)
+    x[:, 0] = x[:, 1] = rng.standard_normal(n) * 0.05                 # steady bed in the fronts
+    hits = np.zeros(n, dtype=np.float32)
+    for k in range(0, n - 2400, SR // 4):
+        hits[k:k + 2400] = rng.standard_normal(2400) * np.exp(-np.arange(2400) / 300.0) * 0.5
+    x[:, 2] = hits + rng.standard_normal(n) * 0.005                   # drum hits in the center
+    x[:, 4] = x[:, 5] = rng.standard_normal(n) * 0.01                 # quiet ambience
+    engine._program_level_db = -20.0
+    if effect == "transient_restore":
+        fx = lambda b: engine._apply_transient_restore(b)
+    else:
+        engine.micro_dyn_amount = 5.0
+        fx = lambda b: engine._apply_micro_dynamics(b)
+    out = blockwise(fx, x, 480)
+    w = 480
+    def gains(ch):
+        o = out[SR // 2:, ch].reshape(-1, w); i = x[SR // 2:, ch].reshape(-1, w)
+        return 10 * np.log10((o ** 2).sum(1) / (i ** 2).sum(1))
+    g_front, g_center, g_amb = gains(0), gains(2), gains(4)
+    assert np.max(np.abs(g_center - g_front)) < 0.3
+    assert np.max(np.abs(g_amb - g_front)) < 0.3
