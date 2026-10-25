@@ -3663,7 +3663,9 @@ class AudioBypass:
         self._spec_streams = engine.process(
             src_block[:, :2], center_spread=self.center_spread, width=width,
             center=self.center_extraction, steering=steering,
-            split_sides_backs=out_ch >= 8).astype(np.float32)
+            split_sides_backs=out_ch >= 8,
+            envelopment=getattr(self, 'envelopment', 0.0),
+            wrap=getattr(self, 'wrap_amount', 0.0)).astype(np.float32)
         self._spec_delayed_src = self._delay_block('spec_src', src_block, engine.latency)
 
     def _route_spectral(self, out_block, out_ch):
@@ -3677,11 +3679,14 @@ class AudioBypass:
         dl, dr, dc, al, ar, side_l, side_r, back_l, back_r = (streams[:, i] for i in range(9))
         d_src = self._spec_delayed_src
 
-        # Ambience split front/rear by the radar's fade (constant power),
-        # surround level by Side Gain.
-        fade = (1.0 - (self.gui_panning_y + 1.0) / 2.0) * (math.pi / 2.0)
-        f_amb = self._get_ramp('_last_spec_famb', math.cos(fade), frames)
-        r_amb = self._get_ramp('_last_spec_ramb', math.sin(fade) * 10 ** (self.side_gain_db / 20.0), frames)
+        # Ambience: additive, like the commercial upmixers - with the radar in
+        # the middle the fronts keep all of it and the surrounds add a
+        # decorrelated, delayed copy around the listener; towards the front
+        # the surround copy fades out, towards the rear the fronts' share.
+        # Surround level by Side Gain.
+        f_amb_g, r_amb_g = self._ambience_front_rear()
+        f_amb = self._get_ramp('_last_spec_famb', f_amb_g, frames)
+        r_amb = self._get_ramp('_last_spec_ramb', r_amb_g * 10 ** (self.side_gain_db / 20.0), frames)
 
         out_block[:, 0] = dl + f_amb * al
         out_block[:, 1] = dr + f_amb * ar
@@ -3710,6 +3715,17 @@ class AudioBypass:
         else:
             out_block[:, 4] = amb_sl + side_l
             out_block[:, 5] = amb_sr + side_r
+
+    def _ambience_front_rear(self):
+        """Front and surround ambience gains from the radar's Y.
+
+        Additive in the middle (front 1, surround 1: the fronts keep their
+        ambience and the surrounds add a decorrelated copy, as Dolby Surround
+        / Neural:X do - a constant-power split made the fronts drier without
+        adding envelopment), front only at the top, surround only at the bottom.
+        """
+        fade = (1.0 - (self.gui_panning_y + 1.0) / 2.0) * (math.pi / 2.0)
+        return min(1.0, math.sqrt(2.0) * math.cos(fade)), min(1.0, math.sqrt(2.0) * math.sin(fade))
 
     def _bass_split(self, sig, key, cutoff_hz=200.0):
         """Stateful 2nd-order low-pass; (sig - result) is the complementary high part."""
@@ -3892,8 +3908,9 @@ class AudioBypass:
         amb = (1.0 - abs(rho)) * bal
         fade = (1.0 - (self.gui_panning_y + 1.0) / 2.0) * (math.pi / 2.0)
         s_gain = 10 ** (self.side_gain_db / 20.0)
-        amb_front = 1.0 - amb * (1.0 - math.cos(fade))   # gain on L/R: removes the ambience share sent back
-        amb_rear = amb * math.sin(fade) * s_gain if out_ch > 4 else 0.0
+        f_amb_g, r_amb_g = self._ambience_front_rear()      # additive (see _ambience_front_rear)
+        amb_front = 1.0 - amb * (1.0 - f_amb_g)            # gain on L/R: ambience share kept in front
+        amb_rear = amb * r_amb_g * s_gain if out_ch > 4 else 0.0
         if out_ch <= 4:
             amb_front = 1.0
 

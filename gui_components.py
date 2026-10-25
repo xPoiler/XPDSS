@@ -505,7 +505,9 @@ class UpmixerWindow(QMainWindow):
                  "With CINEMA STEERING: opposite-phase (matrix-encoded) content becomes\n"
                  "rear point sources; with GAMING PAN too: sharper and faster, sides vs backs on 7.1.\n"
                  "Center Spread = phantom vs. dedicated center, Width = front stage width,\n"
-                 "Side Gain = surround ambience level, radar Y = ambience front/rear balance."),
+                 "Side Gain = surround ambience level, Envelopment = how much is ambience,\n"
+                 "Wrap = wide sources toward the sides, radar Y = ambience front/rear\n"
+                 "(middle: fronts keep it and the surrounds add it around you)."),
                 ("STAGE EQUALIZER", "stage_equalizer", "Balance front/surround weight."),
                 ("CENTER FOCUS", "center_extraction", "Extract dialogue to center speaker."),
                 ("CINEMA STEERING", "cinema_steering",
@@ -591,6 +593,20 @@ class UpmixerWindow(QMainWindow):
         self.sld_width = LabeledSlider("Width Factor", 0.5, 2.0, audio_app.width_factor, suffix="x")
         self.sld_width.valueChanged.connect(lambda v: (setattr(self.audio_app, "width_factor", v), self.request_save()))
         right_panel.addWidget(self.sld_width)
+
+        self.sld_envelopment = LabeledSlider("Envelopment", 0.0, 100.0, getattr(audio_app, 'envelopment', 0.7) * 100.0, suffix="%", is_int=True)
+        self.sld_envelopment.setToolTip("Spectral upmix: how much partly-coherent sound (stereo reverb, wide pads,\n"
+                                        "room) is treated as ambience and played around you (fronts keep it too).\n"
+                                        "0 = only fully uncorrelated sound. Dialogue stays in front.")
+        self.sld_envelopment.valueChanged.connect(lambda v: (setattr(self.audio_app, "envelopment", v / 100.0), self.request_save()))
+        right_panel.addWidget(self.sld_envelopment)
+
+        self.sld_wrap = LabeledSlider("Wrap", 0.0, 100.0, getattr(audio_app, 'wrap_amount', 0.4) * 100.0, suffix="%", is_int=True)
+        self.sld_wrap.setToolTip("Spectral upmix: sources panned wide in the mix extend from the front\n"
+                                 "speakers toward the side surrounds (a wider stage; positions stay fixed).\n"
+                                 "100% = a hard-panned source sits halfway between front and surround.")
+        self.sld_wrap.valueChanged.connect(lambda v: (setattr(self.audio_app, "wrap_amount", v / 100.0), self.request_save()))
+        right_panel.addWidget(self.sld_wrap)
 
         self.sld_sub_gain = LabeledSlider("Sub Gain", 0.0, 5.0, audio_app.sub_gain, suffix="x")
         self.sld_sub_gain.valueChanged.connect(lambda v: (setattr(self.audio_app, "sub_gain", v), self.request_save()))
@@ -909,6 +925,8 @@ class UpmixerWindow(QMainWindow):
             'sld_headroom': ('output_headroom_db', None),
             'sld_side_gain': ('side_gain_db', None),
             'sld_width': ('width_factor', None),
+            'sld_envelopment': ('envelopment', lambda v: v * 100.0),
+            'sld_wrap': ('wrap_amount', lambda v: v * 100.0),
             'sld_sub_gain': ('sub_gain', None),
             'sld_sub_low': ('sub_low_cutoff', None),
             'sld_sub_cutoff': ('sub_drive_cutoff', None),
@@ -984,7 +1002,7 @@ class UpmixerWindow(QMainWindow):
             for b in self.option_buttons.values():
                 b.setDisabled(is_bypass)
 
-        all_sliders = ['sld_spread', 'sld_width', 'sld_side_gain', 'sld_sub_gain', 'sld_sub_cutoff',
+        all_sliders = ['sld_spread', 'sld_width', 'sld_side_gain', 'sld_envelopment', 'sld_wrap', 'sld_sub_gain', 'sld_sub_cutoff',
                        'sld_sub_low', 'sld_transient', 'sld_micro_dyn', 'sld_clarity', 'sld_room_mix', 'sld_air',
                        'sld_trans_delay', 'sld_trans_gain', 'sld_trans_feedback',
                        'sld_speaker_width', 'sld_camera_fov', 'sld_speaker_dist', 'sld_room_width']
@@ -1010,6 +1028,12 @@ class UpmixerWindow(QMainWindow):
 
         if is_bypass:
             return
+
+        # Envelopment / Wrap belong to the spectral engine
+        is_spectral = bool(getattr(app, 'spectral_upmix', False))
+        for name in ('sld_envelopment', 'sld_wrap'):
+            if hasattr(self, name):
+                getattr(self, name).setDisabled(not is_spectral or is_stereo)
 
         # 3. Stereo output disables surround features
         if is_stereo:

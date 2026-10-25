@@ -369,3 +369,37 @@ def test_surround_ambience_is_not_a_coherent_copy_of_the_fronts(engine):
 
     for front, surround in ((0, 6), (1, 7), (0, 4), (6, 4)):
         assert max_corr(out[:, front], out[:, surround]) < 0.35, (front, surround)
+
+
+def test_envelopment_turns_partly_coherent_sound_into_ambience_but_not_a_dry_voice():
+    r = np.random.default_rng(4)
+    a, b, c = r.standard_normal((3, SR * 3)) * 0.05
+    reverb = np.stack([a + 0.7 * c, b + 0.7 * c], axis=1)
+    amb = lambda out: (out[SR:, AMBIENT_L] ** 2 + out[SR:, AMBIENT_R] ** 2).sum()
+    low, high = amb(run(reverb, envelopment=0.0)), amb(run(reverb, envelopment=1.0))
+    assert 10 * np.log10(high / low) > 2.0      # measured +2.8 dB
+    t = np.arange(SR * 3) / SR
+    voice = sum(0.1 / k * np.sin(2 * np.pi * 200 * k * t) for k in range(1, 10))
+    out = run(np.stack([voice, voice], axis=1), envelopment=1.0)
+    assert 10 * np.log10(amb(out) / (out[SR:, DIRECT_C] ** 2).sum()) < -60
+
+
+def test_wrap_extends_wide_sources_toward_the_side_surround_only():
+    r = np.random.default_rng(5)
+    s = r.standard_normal(SR * 3) * 0.1
+    hard_left = run(np.stack([s, 0 * s], axis=1), wrap=1.0)[SR:]
+    p = (hard_left ** 2).sum(0)
+    # an equal front/side split for a hard-panned source, nothing on the right
+    assert abs(10 * np.log10(p[SIDE_L] / p[DIRECT_L])) < 1.0
+    assert p[SIDE_R] < 1e-6 * p[SIDE_L]
+    centre = run(np.stack([s, s], axis=1), wrap=1.0)[SR:]
+    assert (centre[:, SIDE_L] ** 2).sum() < 1e-6 * (centre[:, DIRECT_C] ** 2).sum()
+
+
+def test_ambience_is_additive_with_the_radar_in_the_middle(engine):
+    """Middle position: fronts keep their ambience, the surrounds add it."""
+    assert engine._ambience_front_rear() == pytest.approx((1.0, 1.0))
+    engine.gui_panning_y = 1.0
+    assert engine._ambience_front_rear() == pytest.approx((1.0, 0.0))
+    engine.gui_panning_y = -1.0
+    assert engine._ambience_front_rear() == pytest.approx((0.0, 1.0), abs=1e-9)

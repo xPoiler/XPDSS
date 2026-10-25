@@ -15,6 +15,8 @@ PROFILE_DEFAULTS: Dict[str, Any] = {
     "center_spread": 0.0,
     "side_gain_db": 0.0,
     "width_factor": 1.0,
+    "envelopment": 0.7,   # spectral: how much partly-coherent sound counts as ambience
+    "wrap_amount": 0.4,   # spectral: wide-panned sources extend toward the side surrounds
     "dynamic_eq": False,
     "cinema_steering": False,
     "gaming_panning": False,

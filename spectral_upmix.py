@@ -125,7 +125,8 @@ class SpectralUpmixer:
 
     # ── streaming ─────────────────────────────────────────────────────
     def process(self, stereo: np.ndarray, center_spread: float = 0.0, width: float = 1.0,
-                center: bool = True, steering: int = STEER_OFF, split_sides_backs: bool = False) -> np.ndarray:
+                center: bool = True, steering: int = STEER_OFF, split_sides_backs: bool = False,
+                envelopment: float = 0.0, wrap: float = 0.0) -> np.ndarray:
         """Feed (frames, 2) samples, get (frames, N_STREAMS) streams delayed by `latency`.
 
         Streams: direct L/R/C (front stage), ambient L/R, and the steered
@@ -133,6 +134,10 @@ class SpectralUpmixer:
         on; BACK_* only with split_sides_backs, i.e. a 7.1 layout).
         center_spread 0 = sources panned across L/C/R, 1 = no center (direct
         stays a phantom image in L/R). width scales the panning positions.
+        envelopment (0..1): how much partly-coherent sound (stereo reverb,
+        wide pads, room) counts as ambience instead of direct sound.
+        wrap (0..1): how far sources panned wide in the mix extend toward the
+        side surrounds (SIDE_L/R streams), like a wider front stage.
         """
         frames = stereo.shape[0]
         spread = 1.0 if not center else float(np.clip(center_spread, 0.0, 1.0))
@@ -147,7 +152,8 @@ class SpectralUpmixer:
             frame_list.append(self._frame)
         produced = []
         if frame_list:
-            ys = self._process_frame(np.stack(frame_list), spread, float(width), int(steering), bool(split_sides_backs))
+            ys = self._process_frame(np.stack(frame_list), spread, float(width), int(steering), bool(split_sides_backs),
+                                     float(np.clip(envelopment, 0.0, 1.0)), float(np.clip(wrap, 0.0, 1.0)))
             for y in ys:
                 self._ola += y
                 produced.append(self._ola[:self.hop].copy())
@@ -160,7 +166,8 @@ class SpectralUpmixer:
 
     # ── STFT frames ───────────────────────────────────────────────────
     def _process_frame(self, frames: np.ndarray, spread: float, width: float,
-                       steering: int = STEER_OFF, split: bool = False) -> np.ndarray:
+                       steering: int = STEER_OFF, split: bool = False,
+                       envelopment: float = 0.0, wrap: float = 0.0) -> np.ndarray:
         """frames: (F, n, 2) consecutive analysis frames -> (F, n, N_STREAMS)."""
         X = np.fft.rfft(frames * self.win[None, :, None], axis=1).astype(np.complex64)
         L, R = X[..., 0], X[..., 1]                       # (F, bins)
@@ -241,6 +248,14 @@ class SpectralUpmixer:
             else:
                 self._conf = self._conf + self.conf_alpha * (conf_now[f] - self._conf)
             confidence[f] = self._conf
+        if envelopment > 0.0:
+            # Envelopment: partly coherent sound (stereo reverb, wide pads,
+            # room) is mostly ambience; PCA alone counts only the uncorrelated
+            # remainder as ambient. Scale the direct weight by the slow band
+            # coherence (= cbrt(confidence)) ** (2 * envelopment): coherent
+            # sources keep their weight, diffuse-ish sound becomes ambience.
+            # Smoothed statistics only, so no musical noise.
+            w_direct = w_direct * np.cbrt(confidence) ** (2.0 * envelopment)
         s_dir = w_direct * (np.conj(v1) * L + np.conj(v2) * R)   # direct source signal
         DL = v1 * s_dir
         DR = v2 * s_dir
@@ -325,6 +340,18 @@ class SpectralUpmixer:
         out_c = move * lcr_c * norm
 
         side_l = side_r = back_l = back_r = 0.0
+        if wrap > 0.0:
+            # Wrap: sources panned wide in the mix extend from the front
+            # speaker toward the side surround (constant power, up to an equal
+            # split: a hard-panned source then sits around 60-70 degrees
+            # instead of 30). Positions depend on the source's pan only, so
+            # nothing moves around; the stage gets wider.
+            wr = wrap * np.clip((np.abs(pan) - 0.3) / 0.7, 0.0, 1.0) * w * (math.pi / 4)
+            cw, sw = np.cos(wr), np.sin(wr)
+            side_l = sw * out_l
+            side_r = sw * out_r
+            out_l = cw * out_l
+            out_r = cw * out_r
         if steering != STEER_OFF:
             # Rear point source, panned left/right by its position (constant power)
             th = (pan + 1.0) * (math.pi / 4)
@@ -350,7 +377,7 @@ class SpectralUpmixer:
                 g_side, g_back = 0.8, 0.6
             else:
                 g_side, g_back = 1.0, 0.0
-            side_l, side_r = g_side * src_l, g_side * src_r
+            side_l, side_r = side_l + g_side * src_l, side_r + g_side * src_r
             back_l, back_r = g_back * src_l, g_back * src_r
 
         streams = np.zeros((n_frames, self.bins, N_STREAMS), dtype=np.complex64)
@@ -367,8 +394,10 @@ class SpectralUpmixer:
         # Only synthesise the streams in use (the rear ones are silent unless
         # steering is on; the backs only on 7.1)
         active = list(range(AMBIENT_R + 1))
-        if steering != STEER_OFF:
-            active += [SIDE_L, SIDE_R] + ([BACK_L, BACK_R] if split else [])
+        if steering != STEER_OFF or wrap > 0.0:
+            active += [SIDE_L, SIDE_R]
+        if steering != STEER_OFF and split:
+            active += [BACK_L, BACK_R]
         y = np.zeros((n_frames, self.n, N_STREAMS))
         y[:, :, active] = np.fft.irfft(streams[:, :, active], n=self.n, axis=1) * self.syn_win[None, :, None]
         return y
