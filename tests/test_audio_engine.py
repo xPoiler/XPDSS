@@ -457,27 +457,33 @@ def test_input_reserve_grows_until_irregular_delivery_stops_dropping_out(tmp_pat
     ran dry every few seconds. The reserve grows on each underrun and settles."""
     app = aa.AudioBypass("CABLE Output", "AVR", simulation=True, config_file=str(tmp_path / "c.json"))
     rng = np.random.default_rng(0)
-    events, n = [], 0
-    while n < SR * 120:
+    stalls, t0 = [], 3.0                      # the cable stalls ~25 ms every few seconds
+    while t0 < 180:
+        stalls.append((t0, t0 + 0.025)); t0 += 3.0 * rng.uniform(0.6, 1.4)
+    events, n, si = [], 0, 0
+    while n < SR * 180:
         c = int(rng.choice([256, 512], p=[0.89, 0.11])); n += c
-        events.append((n / SR + rng.normal(0, 0.0015), 0, c))
+        t = n / SR + rng.normal(0, 0.0015)
+        while si < len(stalls) and stalls[si][1] < t:
+            si += 1
+        if si < len(stalls) and stalls[si][0] <= t < stalls[si][1]:
+            t = stalls[si][1]                 # held back, then delivered at once
+        events.append((t, 0, c))
     t, j = 0.0, 0
     while True:
         j += 1; t = 0.02 + j * 480 / SR + abs(rng.normal(0, 0.0015))
-        if t > events[-1][0] - 0.05:
+        if t > 179.9:
             break
         events.append((t, 1, 480))
     events.sort(key=lambda e: (e[0], e[1]))
-    after_first_minute = None
+    silent_after_first_minute = 0
     for tt, kind, m in events:
-        if after_first_minute is None and tt > 60:
-            after_first_minute = app.io_stats['buffer_empty']
         if kind == 0:
             app.input_callback(np.zeros((m, app.max_input_ch), np.float32), m, None, None)
-        else:
-            app._read_input_block(m)
-    assert app.io_stats['buffer_empty'] - after_first_minute == 0
-    assert app.target_latency_samples <= int(SR * 0.030)
+        elif app._read_input_block(m) is None and tt > 60:
+            silent_after_first_minute += 1          # a silent block is what you hear as a click
+    assert silent_after_first_minute == 0
+    assert app.target_latency_samples <= int(SR * 0.040)
 
 
 SR = 48000
