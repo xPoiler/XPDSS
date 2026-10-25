@@ -321,15 +321,22 @@ def _spike_energy_db(sig, ref):
     return 10 * np.log10(P[spikes].sum() / spec(ref).sum() + 1e-15)
 
 
-@pytest.mark.parametrize("coherent_share, limit_db", [(0.0, -60.0), (1.0, -30.0)])
-def test_noise_like_content_does_not_twinkle_in_the_center(coherent_share, limit_db):
+def test_noise_like_content_does_not_twinkle_in_the_center():
     """Reverb / cymbal-like noise must not be scattered bin by bin into the
     center (that is what sounds like an old low-bitrate stream)."""
     r = np.random.default_rng(1)
     a, b, c = r.standard_normal((3, SR * 3)) * 0.05
-    x = np.stack([a + coherent_share * c, b + coherent_share * c], axis=1) * (0.7 if coherent_share else 1.0)
+    # Diffuse: (almost) nothing reaches the center
+    out = run(np.stack([a, b], axis=1))[SR:]
+    assert _spike_energy_db(out[:, DIRECT_C], a[SR:]) < -60.0
+    # Half-coherent: the common part legitimately plays from the center, but
+    # it must be as smooth as the noise itself (no extra isolated spikes)
+    x = np.stack([a + c, b + c], axis=1) * 0.7
     out = run(x)[SR:]
-    assert _spike_energy_db(out[:, DIRECT_C], x[SR:, 0]) < limit_db
+    natural = _spike_energy_db(c[SR:], c[SR:])
+    # (measured: ~2 dB over natural noise, unchanged since the musical-noise fix;
+    # bin-by-bin scattering gave far more)
+    assert _spike_energy_db(out[:, DIRECT_C], out[:, DIRECT_C]) < natural + 2.5
 
 
 def test_close_notes_do_not_intermodulate():

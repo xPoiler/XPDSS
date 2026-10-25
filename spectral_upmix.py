@@ -78,6 +78,7 @@ class SpectralUpmixer:
         self.alpha = 1.0 - math.exp(-dt / stats_tau)
         self.alpha_gaming = 1.0 - math.exp(-dt / gaming_tau)
         self.conf_alpha = 1.0 - math.exp(-dt / 0.3)
+        self.band_move = 1.0     # how far low-confidence bins follow their band direction (0 = stay put)
         # Short-term averages make uncorrelated (diffuse) signals look partly
         # correlated: the expected spurious |L R*|^2 of an exponential average
         # is about alpha / (2 - alpha) * |L|^2 |R|^2. Subtracting it (x `debias`)
@@ -249,6 +250,18 @@ class SpectralUpmixer:
         a1, a2 = np.abs(v1), np.abs(v2)
         # amplitude ratio R/L as an angle: 0 = hard left, pi/4 = center, pi/2 = hard right
         angle = np.arctan2(a2, a1)
+        # Low-confidence bins (noise-like: snare and cymbal tops, sibilance,
+        # breath) take the direction of their band instead of their own: it is
+        # smooth across frequency and time, so moving them cannot twinkle, and a
+        # source's upper spectrum lands where its body does instead of staying
+        # behind as a phantom (a voice/snare split between C and L/R by frequency).
+        b_half = 0.5 * (b_pll - b_prr)
+        b_root = np.sqrt(b_half ** 2 + np.abs(b_plr) ** 2)
+        b_lam1 = 0.5 * (b_pll + b_prr) + b_root
+        bw1 = np.maximum(b_lam1 - b_prr, 0.0)       # |v1|^2 and |v2|^2 up to a common factor
+        bw2 = np.maximum(b_lam1 - b_pll, 0.0)
+        angle_band = np.arctan2(np.sqrt(bw2), np.sqrt(bw1))
+        angle = confidence * angle + (1.0 - confidence) * angle_band
 
         # Re-pan the direct part across L / C / R (constant power)
         pan = (angle - math.pi / 4) / (math.pi / 4)   # -1 left .. +1 right
@@ -274,6 +287,13 @@ class SpectralUpmixer:
         rear_raw = rear
         if steering == STEER_GAMING:
             rear = np.clip((rear - 0.25) / 0.5, 0.0, 1.0)  # decisive front/back
+        # Below ~150 Hz nothing is moved (bass stays in L/R as it is); across
+        # the 150-250 Hz handover every decision fades in with w. Folding w into
+        # the decisions (instead of crossfading the processed and the original
+        # signal) keeps the handover at constant power: no dip in the body of
+        # voices and instruments there.
+        w = self.process_weight
+        rear = rear * w
         front = 1.0 - rear
 
         if steering == STEER_OFF:
@@ -289,10 +309,20 @@ class SpectralUpmixer:
         lcr_r = g_r * mag * f_amp * u_r
         lcr_c = g_c * mag * f_amp * u_c
 
-        move = (1.0 - spread) * confidence
-        out_l = move * lcr_l + (1.0 - move) * DL * f_amp + keep_l
-        out_r = move * lcr_r + (1.0 - move) * DR * f_amp + keep_r
-        out_c = move * lcr_c
+        # (weighted by the band's slow-smoothed coherence: fully diffuse sound
+        # stays where it is, and beating close notes do not modulate the move)
+        move = (1.0 - spread) * (confidence + (1.0 - confidence) * self.band_move * np.cbrt(confidence)) * w
+        # Partly moved bins blend two pannings of the same signal; an amplitude
+        # blend of two different speaker sets loses power (up to 3 dB at 50/50:
+        # duller transients and voices), so the blend is renormalised to the
+        # direct power. Gains come from smoothed statistics only.
+        c_l = move * g_l * u_l + (1.0 - move) * v1
+        c_r = move * g_r * u_r + (1.0 - move) * v2
+        c_c = move * g_c
+        norm = 1.0 / np.sqrt(np.maximum(np.abs(c_l) ** 2 + np.abs(c_r) ** 2 + c_c ** 2, 0.25))
+        out_l = (move * lcr_l + (1.0 - move) * DL * f_amp) * norm + keep_l
+        out_r = (move * lcr_r + (1.0 - move) * DR * f_amp) * norm + keep_r
+        out_c = move * lcr_c * norm
 
         side_l = side_r = back_l = back_r = 0.0
         if steering != STEER_OFF:
@@ -323,18 +353,16 @@ class SpectralUpmixer:
             side_l, side_r = g_side * src_l, g_side * src_r
             back_l, back_r = g_back * src_l, g_back * src_r
 
-        # Below ~150 Hz nothing is moved: bass stays in L/R as it is
-        w = self.process_weight
         streams = np.zeros((n_frames, self.bins, N_STREAMS), dtype=np.complex64)
-        streams[..., DIRECT_L] = w * out_l + (1.0 - w) * L
-        streams[..., DIRECT_R] = w * out_r + (1.0 - w) * R
-        streams[..., DIRECT_C] = w * out_c
+        streams[..., DIRECT_L] = out_l + (1.0 - w) * AL   # unprocessed ambience stays in L/R
+        streams[..., DIRECT_R] = out_r + (1.0 - w) * AR
+        streams[..., DIRECT_C] = out_c
         streams[..., AMBIENT_L] = w * AL
         streams[..., AMBIENT_R] = w * AR
-        streams[..., SIDE_L] = w * side_l
-        streams[..., SIDE_R] = w * side_r
-        streams[..., BACK_L] = w * back_l
-        streams[..., BACK_R] = w * back_r
+        streams[..., SIDE_L] = side_l
+        streams[..., SIDE_R] = side_r
+        streams[..., BACK_L] = back_l
+        streams[..., BACK_R] = back_r
 
         # Only synthesise the streams in use (the rear ones are silent unless
         # steering is on; the backs only on 7.1)
