@@ -756,3 +756,35 @@ def test_switching_tilt_does_not_click(engine):
     # a sine through a smooth system has a bounded second difference
     d2 = np.abs(np.diff(out[:, 0], 2))
     assert d2.max() < 3 * (0.3 * (2 * np.pi * 220 / SR) ** 2) * 2.0 + 1e-3
+
+
+@pytest.mark.parametrize("att, rel, n_ch", [(0.9, 0.999, 1), (0.0, 0.995, 1), (0.0, np.array([0.99, 0.9995]), 2)])
+def test_envelope_follower_matches_reference(att, rel, n_ch):
+    """The scalar fast path must be bit-identical to the original numpy loop."""
+    def reference(abs_block, att_coeff, rel_coeff, zi, dec=8):
+        n_samp, n_ch = abs_block.shape
+        pad = (dec - n_samp % dec) % dec
+        padded = np.concatenate([abs_block, np.zeros((pad, n_ch), dtype=abs_block.dtype)]) if pad else abs_block
+        n_dec = padded.shape[0] // dec
+        dec_in = padded.reshape(n_dec, dec, n_ch).max(axis=1)
+        att_d, rel_d = att_coeff ** dec, rel_coeff ** dec
+        dec_env = np.empty_like(dec_in)
+        prev = zi.copy()
+        for i in range(n_dec):
+            s = dec_in[i:i + 1]
+            cf = np.where(s > prev, att_d, rel_d)
+            prev = cf * prev + (1.0 - cf) * s
+            dec_env[i] = prev[0]
+        x_dec = np.arange(n_dec) * dec + dec // 2
+        env = np.empty((n_samp, n_ch), dtype=abs_block.dtype)
+        for ch in range(n_ch):
+            env[:, ch] = np.interp(np.arange(n_samp), x_dec, dec_env[:, ch])
+        return env, prev
+    rng = np.random.default_rng(9)
+    zi_a = np.full((1, n_ch), 0.3)
+    zi_b = zi_a.copy()
+    for size in (480, 441, 7):
+        x = np.abs(rng.standard_normal((size, n_ch)))
+        ea, zi_a = aa.AudioBypass._asym_env_decimated(x, att, rel, zi_a)
+        eb, zi_b = reference(x, att, rel, zi_b)
+        assert np.array_equal(ea, eb) and np.array_equal(zi_a, zi_b)

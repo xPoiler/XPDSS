@@ -1596,14 +1596,33 @@ class AudioBypass:
         att_d = att_coeff ** dec
         rel_d = rel_coeff ** dec
 
-        # Serial loop at decimated rate
+        # Serial loop at decimated rate, on plain Python floats per channel
+        # (same IEEE double arithmetic as the former numpy version, so the
+        # result is bit-identical, without per-sample numpy call overhead)
         dec_env = np.empty_like(dec_in)
-        prev = zi.copy()
-        for i in range(n_dec):
-            s = dec_in[i:i+1]
-            cf = np.where(s > prev, att_d, rel_d)
-            prev = cf * prev + (1.0 - cf) * s
-            dec_env[i] = prev[0]
+        if n_dec == 0:
+            return np.empty((0, n_ch), dtype=abs_block.dtype), zi.copy()
+        # coefficients may be scalars or one per channel (limiter groups)
+        att_v = np.broadcast_to(np.asarray(att_d, dtype=np.float64).reshape(-1), (n_ch,))
+        rel_v = np.broadcast_to(np.asarray(rel_d, dtype=np.float64).reshape(-1), (n_ch,))
+        prev_out = np.empty((1, n_ch), dtype=np.result_type(zi.dtype, np.float64))
+        for ch in range(n_ch):
+            att_d = float(att_v[ch])
+            rel_d = float(rel_v[ch])
+            att_c = 1.0 - att_d
+            rel_c = 1.0 - rel_d
+            p = float(zi[0, ch])
+            col = dec_in[:, ch].tolist()
+            out_col = [0.0] * n_dec
+            for i, v in enumerate(col):
+                if v > p:
+                    p = att_d * p + att_c * v
+                else:
+                    p = rel_d * p + rel_c * v
+                out_col[i] = p
+            dec_env[:, ch] = out_col
+            prev_out[0, ch] = p
+        prev = prev_out
 
         # Linear interpolation back to full rate
         # Build sample indices for the decimated envelope (center of each chunk)
@@ -2072,14 +2091,15 @@ class AudioBypass:
             return
             
         n_ch = block.shape[1]
-        # Use a copy for the side-chain to avoid modifying the original block before summing
-        excited = np.zeros_like(block)
-        
-        # 1. High-pass filter
-        for ch in range(n_ch):
-            zi = self._ensure_sos_zi(self._air_hp_zi, ch, self._air_hp_sos)
-            excited[:, ch], self._air_hp_zi[ch] = sosfilt(self._air_hp_sos, block[:, ch], zi=zi)
-            
+        n_sec = np.asarray(self._air_hp_sos).shape[0]
+        # 1. High-pass filter (all channels in one call: same per-channel
+        #    arithmetic as one call per channel)
+        zi = self._air_hp_zi.get('all')
+        if not isinstance(zi, np.ndarray) or zi.shape != (n_sec, 2, n_ch):
+            zi = np.zeros((n_sec, 2, n_ch))
+        hp, self._air_hp_zi['all'] = sosfilt(self._air_hp_sos, block, axis=0, zi=zi)
+        excited = hp.astype(block.dtype)
+
         # 2. Harmonics: smooth, bounded odd-order term (no discontinuity)
         harmonics = 0.25 * np.tanh(2.0 * excited) ** 3
 
@@ -2088,10 +2108,11 @@ class AudioBypass:
         #     phase still adds constructively to the dry signal.
         if not hasattr(self, '_air_post_zi'):
             self._air_post_zi = {}
-        for ch in range(n_ch):
-            zi = self._ensure_sos_zi(self._air_post_zi, ch, self._air_hp_sos)
-            harmonics[:, ch], self._air_post_zi[ch] = sosfilt(self._air_hp_sos, harmonics[:, ch], zi=zi)
-        excited += harmonics
+        zi = self._air_post_zi.get('all')
+        if not isinstance(zi, np.ndarray) or zi.shape != (n_sec, 2, n_ch):
+            zi = np.zeros((n_sec, 2, n_ch))
+        post, self._air_post_zi['all'] = sosfilt(self._air_hp_sos, harmonics, axis=0, zi=zi)
+        excited += post.astype(block.dtype)
 
         # 3. Mix
         amount = self._live_param('air_amount')
@@ -2660,7 +2681,10 @@ class AudioBypass:
         sub_f = detected_f / 2.0
 
         # Use the analysis buffer for spectral measurement (already accumulated)
-        spec = np.abs(np.fft.rfft(buf * np.hanning(len(buf))))
+        win = getattr(self, '_sub_spec_win', None)
+        if win is None or win.shape[0] != len(buf):
+            win = self._sub_spec_win = np.hanning(len(buf))
+        spec = np.abs(np.fft.rfft(buf * win))
         freq_res = sr / len(buf)
 
         # Energy in a ±20% band around fundamental and subharmonic
