@@ -296,13 +296,21 @@ class SpectralUpmixer:
 
         side_l = side_r = back_l = back_r = 0.0
         if steering != STEER_OFF:
-            out_l = out_l + (1.0 - confidence) * r_amp * DL
-            out_r = out_r + (1.0 - confidence) * r_amp * DR
             # Rear point source, panned left/right by its position (constant power)
             th = (pan + 1.0) * (math.pi / 4)
             rear_mag = mag * r_amp * confidence
             src_l = np.cos(th) * rear_mag * u_l     # one common phase: a coherent
             src_r = np.sin(th) * rear_mag * u_l     # rear image, not an anti-phase one
+            # The rear part of low-confidence bins (noise-like content, and any
+            # source while its statistics settle after a front->rear move) is
+            # not re-panned bin by bin, but it still belongs behind: it goes to
+            # the surrounds as its own L/R pair with the right channel's
+            # polarity flipped (same-polarity pair, levels untouched), instead
+            # of staying in the fronts as an anti-phase phantom. Linear and
+            # constant power with the front part (f_amp^2 + r_amp^2 = 1).
+            low = (1.0 - confidence) * r_amp
+            src_l = src_l + low * DL
+            src_r = src_r - low * DR
             if split and steering == STEER_GAMING:
                 # 7.1: beside (~110-120 deg phase) -> sides, behind (180 deg) -> backs
                 behind = np.clip((rear_raw - 0.5) / 0.5, 0.0, 1.0) * (math.pi / 2)

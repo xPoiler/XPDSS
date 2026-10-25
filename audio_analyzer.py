@@ -258,10 +258,6 @@ class AudioBypass:
         self.dyn_eq_level = 0.0 # Track master volume smoothed (Dynamic EQ)
         self.bypass_all = False
 
-        self._prev_SL = np.array([0.0], dtype=np.float64)  # 1-Pole LPF state L (gaming 5.1 shading)
-        self._prev_SR = np.array([0.0], dtype=np.float64)  # 1-Pole LPF state R
-        self._dyn_narrowness_smooth = 0.5 # Track real-time narrowness
-        self._applied_width_smooth = 1.0  # Track gain match smoothing
         self.correlation_smooth = 0.0 # 0.0 (Wide) to 1.0 (Mono)
 
         # --- Real-time Pre-allocations ---
@@ -1055,7 +1051,7 @@ class AudioBypass:
         '_sub_period_est', '_sub_need_smooth', '_sub_last_avoid',
         '_vl_voice_mask', '_dlg_bp_sos', '_dlg_bp_zi', '_air_post_zi',
         '_rs_out_pre', '_spectral', '_delay_hist', '_spectral_was_active',
-        '_bass_split_sos', '_amb_shelf_sos',
+        '_bass_split_sos', '_amb_shelf_sos', '_cls_stats',
     )
 
     def _reset_dsp_state(self):
@@ -3690,185 +3686,154 @@ class AudioBypass:
             ramp = self._get_ramp('_last_pass_dyn', boost_factor, frames)
             out_block[:, 3] *= ramp
 
-    CLASSIC_MATCH_GAIN = 1.116  # +0.95 dB, see end of _route_upmix
+    CLASSIC_MATCH_GAIN = 1.0  # spectral/classic level match, see end of _route_upmix
+    # Statistics time constants (s): placement must not wander on music;
+    # steering follows faster, gaming fastest (as in the spectral engine).
+    # Each surround mixes in a little of the opposite side's ambience (30 deg:
+    # 0.87 own - 0.5 other), so it is less coherent with its own front (comb
+    # ripple 11 -> 8 dB on diffuse sound) while staying mostly left / right.
+    CLASSIC_AMB_CROSS = math.radians(30.0)
+    CLASSIC_TAU = {'static': 0.30, 'cinema': 0.07, 'gaming': 0.04}
 
     def _route_upmix(self, src_block, out_block, out_ch):
-        """Static / cinema / gaming Mid-Side upmix of the front pair."""
-        # 2. Advanced Upmix Steering
+        """Classic (time-domain, broadband) correlation-driven upmix.
+
+        L and R never leave their own fronts and nothing is ever played as an
+        inverted copy of the other side:
+          - the center takes the part that is common to L and R (correlation
+            x balance: hard-panned or uncorrelated content gives no center),
+            the fronts give up the same power (constant power);
+          - the surrounds take the uncorrelated, balanced part (ambience),
+            the correlated part cancelled out of each side, decorrelated and
+            ~10 ms late (shared helper with the spectral engine);
+          - with cinema/gaming steering, opposite-phase (matrix-encoded)
+            content leaves the fronts and becomes a same-polarity rear source,
+            panned by its L/R balance (7.1 gaming: sides vs backs by depth).
+        Below ~200 Hz nothing is moved. One set of broadband gains per block
+        from smoothed statistics: cheap, stable, but - unlike the spectral
+        engine - it cannot separate sources playing at the same time.
+        """
         L = src_block[:, 0]
         R = src_block[:, 1]
-
-        # 1. Base Mid/Side Extraction (Reference Frame)
-        Mid = (L + R) * 0.5
-        Side_L_base = L - Mid
-        Side_R_base = R - Mid
-        # Below ~200 Hz nothing is moved (as in the spectral engine): bass
-        # stays in L/R, so the center and the surrounds never get bass that
-        # would comb-filter against the fronts or change the body of the mix.
-        mid_lo = self._bass_split(Mid, 'classic_mid')
-        side_lo = self._bass_split(Side_L_base, 'classic_side')
-        mid_hi = Mid - mid_lo
-        side_hi = Side_L_base - side_lo
-
-        # Calculate dynamic offsets OR adaptive steering
-        cinema_active = getattr(self, 'cinema_steering', False)
-
-        if cinema_active:
-             # Calculate real-time block-level energy
-             mid_amp = np.sqrt(np.mean(Mid**2) + 1e-6)
-             side_amp = np.sqrt(np.mean((Side_L_base**2 + Side_R_base**2) * 0.5) + 1e-6)
-             target_narrowness = mid_amp / (mid_amp + side_amp)
-             
-             # Leaky Integrator for smooth state-tracking (Creates ~1.0 sec smoothing)
-             current_narrow = getattr(self, '_dyn_narrowness_smooth', target_narrowness)
-             current_narrow = current_narrow * 0.99 + target_narrowness * 0.01
-             self._dyn_narrowness_smooth = current_narrow
-        else:
-             current_narrow = 0.5 # Default balanced
-
-        width_factor = self.width_factor
-        applied_width = max(0.5, min(2.0, width_factor))
-        applied_spread = max(0.0, min(1.0, self.center_spread))
-
-        if cinema_active:
-             # Cinema Steering: Center tapers off as signal becomes panned
-             center_steering_gain = max(0.0, (current_narrow - 0.5) * 2.0)
-             center_gain = center_steering_gain
-             phantom_gain = 1.0 - center_steering_gain
-             target_width = width_factor
-        else:
-             center_gain = 1.0 - applied_spread
-             phantom_gain = applied_spread
-             target_width = applied_width
-
-        # Rate-Limit Gain updates with fast responsiveness (Prevent pops without lag)
-        if cinema_active:
-             curr_w = getattr(self, '_applied_width_smooth', target_width)
-             curr_w = curr_w * 0.40 + target_width * 0.60 
-             self._applied_width_smooth = curr_w
-             applied_width = curr_w
-
-        # 1. Ramping for Width, Center, and Phantom-Mid
         frames = src_block.shape[0]
-        aw_r = self._get_ramp('_last_aw', applied_width, frames)
-        cg_r = self._get_ramp('_last_cg', center_gain, frames)
-        pg_r = self._get_ramp('_last_pg', phantom_gain, frames)
-        
-        # Apply Ramps (bass mid always stays a phantom in the fronts)
-        center_signal = mid_hi * cg_r
-        phantom_mid = mid_lo + mid_hi * pg_r
-        phantom_hi = mid_hi * pg_r
+        L_lo = self._bass_split(L, 'classic_l')
+        R_lo = self._bass_split(R, 'classic_r')
+        Lh = L - L_lo
+        Rh = R - R_lo
 
-        # Final extraction scaling (side above the bass handover)
-        side = side_hi * aw_r
+        cinema_active = bool(getattr(self, 'cinema_steering', False))
+        gaming = cinema_active and bool(getattr(self, 'gaming_panning', False))
+        mode = 'gaming' if gaming else ('cinema' if cinema_active else 'static')
 
-        # Widening Mode Buffering (Always update to prevent pops)
-        # Zero-fill on toggle to prevent ghost audio from stale buffer
+        # Smoothed L/R statistics of the band above the bass handover
+        now = np.array([np.dot(Lh, Lh), np.dot(Rh, Rh), np.dot(Lh, Rh)], dtype=np.float64) / max(frames, 1)
+        st = getattr(self, '_cls_stats', None)
+        if st is None:
+            st = now
+        else:
+            k = 1.0 - math.exp(-frames / (self.CLASSIC_TAU[mode] * self.sample_rate))
+            st = st + k * (now - st)
+        self._cls_stats = st
+        pll, prr, plr = float(st[0]), float(st[1]), float(st[2])
+        geo = math.sqrt(pll * prr)
+        if geo > 1e-12:
+            rho = max(-1.0, min(1.0, plr / geo))
+            bal = min(1.0, 2.0 * geo / (pll + prr))  # 1 = balanced, 0 = one-sided
+        else:
+            rho, bal = 0.0, 0.0                      # silence or hard-panned
+        rho_pos, rho_neg = max(rho, 0.0), max(-rho, 0.0)
+
+        # Center: common part, scaled by Center Spread (phantom vs center)
+        spread = max(0.0, min(1.0, self.center_spread))
+        use_center = bool(self.center_extraction) and out_ch > 2
+        g_c = (1.0 - spread) * rho_pos * bal if use_center else 0.0
+
+        # Rear (steering only): opposite-phase part
+        rear = 0.0
+        if cinema_active and out_ch > 4:
+            rear = rho_neg if not gaming else max(0.0, min(1.0, (rho_neg - 0.25) / 0.5))
+        rear *= bal                                  # hard-panned: no phase info
+
+        # Ambience: uncorrelated and balanced; front/rear by the radar (static)
+        amb = (1.0 - abs(rho)) * bal
+        fade = (1.0 - (self.gui_panning_y + 1.0) / 2.0) * (math.pi / 2.0)
+        s_gain = 10 ** (self.side_gain_db / 20.0)
+        amb_front = 1.0 - amb * (1.0 - math.cos(fade))   # gain on L/R: removes the ambience share sent back
+        amb_rear = amb * math.sin(fade) * s_gain if out_ch > 4 else 0.0
+        if out_ch <= 4:
+            amb_front = 1.0
+
+        rear = min(1.0, rear)
+        k_front = math.sqrt(max(0.0, 1.0 - g_c * g_c)) * math.sqrt(1.0 - rear) * amb_front
+        alpha = rho_pos                              # cancels the correlated part out of each surround feed
+
+        kf_r = self._get_ramp('_last_cls_kf', k_front, frames)
+        gc_r = self._get_ramp('_last_cls_gc', g_c * math.sqrt(2.0), frames)
+        al_r = self._get_ramp('_last_cls_alpha', alpha, frames)
+        ar_r = self._get_ramp('_last_cls_amb', amb_rear / math.sqrt(1.0 + alpha * alpha), frames)
+
+        Mid_h = (Lh + Rh) * 0.5
+        FL = L_lo + Lh * kf_r
+        FR = R_lo + Rh * kf_r
+        # Width (front stage, 1.0 = as mixed)
+        w = max(0.5, min(2.0, self.width_factor))
+        if abs(w - 1.0) > 1e-6:
+            fm = (FL + FR) * 0.5
+            fs = (FL - FR) * 0.5
+            FL, FR = fm + w * fs, fm - w * fs
+        Center = Mid_h * gc_r
+
+        # Widening: delayed copy of the mid into the surround ambience
         widening_on = bool(getattr(self, 'widening_mode', False))
         if widening_on and not self._widening_was_on:
             self.widening_buffer.fill(0.0)
         self._widening_was_on = widening_on
-
-        frames = phantom_hi.shape[0]
         end1 = min(frames, self.widening_buffer_size - self.widening_write_ptr)
-        self.widening_buffer[self.widening_write_ptr : self.widening_write_ptr + end1] = phantom_hi[:end1]
+        self.widening_buffer[self.widening_write_ptr: self.widening_write_ptr + end1] = Mid_h[:end1]
         if end1 < frames:
-            self.widening_buffer[:frames - end1] = phantom_hi[end1:frames]
-
+            self.widening_buffer[:frames - end1] = Mid_h[end1:frames]
         delay_samples = int(self.sample_rate * (self.widening_delay_ms / 1000.0))
         read_ptr = (self.widening_write_ptr - delay_samples) % self.widening_buffer_size
-
         delayed_mid = np.zeros(frames, dtype=np.float32)
         end_r1 = min(frames, self.widening_buffer_size - read_ptr)
-        delayed_mid[:end_r1] = self.widening_buffer[read_ptr : read_ptr + end_r1]
+        delayed_mid[:end_r1] = self.widening_buffer[read_ptr: read_ptr + end_r1]
         if end_r1 < frames:
             delayed_mid[end_r1:frames] = self.widening_buffer[:frames - end_r1]
-
         self.widening_write_ptr = (self.widening_write_ptr + frames) % self.widening_buffer_size
-
-        # Side Gain Scaling (dB to linear)
-        s_gain = 10 ** (self.side_gain_db / 20.0)
-
-        # Distribution Scales (constant power front/rear, like the spectral engine)
-        if cinema_active:
-             # Cinema Steering: Anti-phase goes strictly back
-             # angle maps narrowness from 1.0 (Mono, Front) to 0.0 (Anti, Rear)
-             side_angle_cin = (1.0 - current_narrow) * (math.pi / 2.0)
-             front_scale = math.cos(side_angle_cin)
-             rear_scale = math.sin(side_angle_cin)
-             side_boost = 1.0
-        else:
-             fade = (1.0 - (self.gui_panning_y + 1.0) / 2.0) * (math.pi / 2.0)
-             front_scale = math.cos(fade)
-             rear_scale = math.sin(fade)
-             side_boost = s_gain
-
-        # 2. Ramping for Distribution Scales
-        fs_r = self._get_ramp('_last_fs', front_scale, frames)
-        rs_r = self._get_ramp('_last_rs', rear_scale, frames)
-        sb_r = self._get_ramp('_last_sb', side_boost, frames)
-
-        # Final Channel Build (Apply steering weights)
-        gap_active = cinema_active and getattr(self, 'gaming_panning', False)
-
-        if gap_active:
-             # Steeper Gaming curve
-             if current_narrow >= 0.5:
-                  side_angle_gap = (1.0 - current_narrow) * math.pi
-             else:
-                  side_angle_gap = math.pi / 2.0
-             fg = math.cos(side_angle_gap)
-             rg = math.sin(side_angle_gap)
-
-             # Smoothly scale phantom_mid in front based on narrowness
-             front_mid_fade = max(0.0, min(1.0, (current_narrow - 0.5) * 2.0))
-             FL = side_lo + side * fg + mid_lo + phantom_hi * front_mid_fade
-             FR = -side_lo - side * fg + mid_lo + phantom_hi * front_mid_fade
-        else:
-             FL = side_lo + side * fs_r + phantom_mid
-             FR = -side_lo - side * fs_r + phantom_mid
-
-        # Center Extraction Focus
-        center_extraction_active = self.center_extraction
-        Center = center_signal if center_extraction_active else 0.0
-        if not center_extraction_active:
-            # Re-fold if extraction is manually disabled (Legacy toggle support)
-            FL += center_signal * 0.5
-            FR += center_signal * 0.5
 
         sides = None   # (left, right) for the side pair / 5.1 surrounds
         backs = None   # (left, right) for the 7.1 back pair
-        if gap_active:
-             # Gaming: L/R-like point sources (mid +/- side), time-aligned with
-             # the fronts and not diffused (positional audio)
-             rear_mid_contrib = phantom_hi * (1.0 - front_mid_fade)
-             base_L = side * rg * sb_r + rear_mid_contrib
-             base_R = -side * rg * sb_r + rear_mid_contrib
-             if out_ch >= 7:
-                  # 7.1 split: continuous crossfade toward the backs as content goes rear
-                  bl_f = max(0.0, 1.0 - current_narrow * 2.0)
-                  sides = (base_L, base_R)
-                  backs = (base_L * bl_f, base_R * bl_f)
-             else:
-                  # 5.1 EQ Shading — always run LPF, crossfade by narrowness
-                  alpha = 0.5
-                  SL_lp, self._prev_SL = lfilter([alpha], [1, -(1 - alpha)], base_L.astype(np.float64), zi=self._prev_SL)
-                  SR_lp, self._prev_SR = lfilter([alpha], [1, -(1 - alpha)], base_R.astype(np.float64), zi=self._prev_SR)
-                  lp_blend = max(0.0, min(1.0, 1.0 - current_narrow * 2.0))
-                  sides = (base_L * (1.0 - lp_blend) + SL_lp.astype(np.float32) * lp_blend,
-                           base_R * (1.0 - lp_blend) + SR_lp.astype(np.float32) * lp_blend)
-        elif out_ch > 4:
-             # Static / cinema: the side (ambience) signal feeds BOTH surrounds
-             # with the same polarity (L-R and R-L played as an inverted pair
-             # sounds phasey and cancels), decorrelated so the pair - and the
-             # surrounds vs. the fronts - are not coherent copies, 10 ms later
-             # than the fronts (precedence keeps the image in front) and with
-             # a gentle top-octave roll-off, like real lateral ambience.
-             amb = side * rs_r * sb_r
-             if widening_on:
-                 amb = amb + delayed_mid * rs_r * sb_r
-             amb = self._surround_ambience(amb, out_ch, bank='classic')
-             sides, backs = amb
+        if out_ch > 4:
+            amb_l = (Lh - al_r * Rh) * ar_r
+            amb_r = (Rh - al_r * Lh) * ar_r
+            cb, sb = math.cos(self.CLASSIC_AMB_CROSS), math.sin(self.CLASSIC_AMB_CROSS)
+            amb_l, amb_r = cb * amb_l - sb * amb_r, cb * amb_r - sb * amb_l
+            if widening_on:
+                wm = delayed_mid * (0.5 * math.sin(fade) * s_gain)
+                amb_l = amb_l + wm
+                amb_r = amb_r + wm
+            sides, backs = self._surround_ambience((amb_l, amb_r), out_ch, bank='classic')
+
+            # Steered rear point source: same polarity, panned by L/R balance,
+            # time-aligned with the fronts and not diffused (positional)
+            th = math.atan2(math.sqrt(prr), math.sqrt(pll)) if (pll + prr) > 1e-12 else math.pi / 4
+            g_rear = math.sqrt(2.0 * rear)
+            if out_ch >= 8:
+                if gaming:
+                    behind = max(0.0, min(1.0, (rho_neg - 0.5) / 0.5)) * (math.pi / 2)
+                    g_side, g_back = math.cos(behind), math.sin(behind)
+                else:
+                    g_side, g_back = 0.8, 0.6
+            else:
+                g_side, g_back = 1.0, 0.0
+            rl_s = self._get_ramp('_last_cls_rls', g_rear * math.cos(th) * g_side, frames)
+            rr_s = self._get_ramp('_last_cls_rrs', g_rear * math.sin(th) * g_side, frames)
+            S_d = (Lh - Rh) * 0.5
+            sides = (sides[0] + S_d * rl_s, sides[1] + S_d * rr_s)
+            if backs is not None:
+                rl_b = self._get_ramp('_last_cls_rlb', g_rear * math.cos(th) * g_back, frames)
+                rr_b = self._get_ramp('_last_cls_rrb', g_rear * math.sin(th) * g_back, frames)
+                backs = (backs[0] + S_d * rl_b, backs[1] + S_d * rr_b)
 
         # Consistent Sub Level: L+R redirected at -10dB (0.316), full band (see passthrough)
         LFE = (L + R) * 0.316
@@ -3883,9 +3848,9 @@ class AudioBypass:
             ramp = self._get_ramp('_last_up_dyn', boost_factor, LFE.shape[0])
             LFE *= ramp
 
-        # Level match with the spectral engine (measured on diffuse, partly
-        # coherent and panned material: classic was ~0.95 dB quieter), so an
-        # A/B between the engines is not decided by loudness. LFE untouched.
+        # Level match with the spectral engine (constant-power design: within
+        # ~0.2 dB on diffuse / partly coherent material, ~+1 dB on dense
+        # panned mixes), so an A/B is not decided by loudness. LFE untouched.
         g = self.CLASSIC_MATCH_GAIN
         out_block[:, 0] = FL * g
         out_block[:, 1] = FR * g

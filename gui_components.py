@@ -465,7 +465,9 @@ class UpmixerWindow(QMainWindow):
                 ("SPECTRAL UPMIX", "spectral_upmix",
                  "Frequency-domain upmix: each source is placed across L/C/R from its own\n"
                  "position in the mix, only ambience goes to the surrounds.\n"
-                 "Off = classic upmix (A/B, matched in level). Adds 21 ms latency while selected.\n"
+                 "Off = classic upmix (A/B, matched in level): same placement rules but one set of\n"
+                 "broadband gains, so it cannot separate sources playing at the same time.\n"
+                 "Spectral adds 21 ms latency while selected.\n"
                  "Surround ambience in both engines is delayed ~10 ms, decorrelated\n"
                  "and mostly lateral (sides > backs on 7.1).\n"
                  "With CINEMA STEERING: opposite-phase (matrix-encoded) content becomes\n"
@@ -474,8 +476,12 @@ class UpmixerWindow(QMainWindow):
                  "Side Gain = surround ambience level, radar Y = ambience front/rear balance."),
                 ("STAGE EQUALIZER", "stage_equalizer", "Balance front/surround weight."),
                 ("CENTER FOCUS", "center_extraction", "Extract dialogue to center speaker."),
-                ("CINEMA STEERING", "cinema_steering", "Phase-detector surround steering."),
-                ("GAMING PAN", "gaming_panning", "Extreme pans to side/rear surrounds."),
+                ("CINEMA STEERING", "cinema_steering",
+                 "Opposite-phase (matrix-encoded) content leaves the fronts and plays\n"
+                 "from the surrounds as a rear source; gradual front/back fade."),
+                ("GAMING PAN", "gaming_panning",
+                 "With CINEMA STEERING: decisive front/back decisions and ~2x faster\n"
+                 "tracking. On 7.1 also splits rear sources between sides and backs."),
                 ("LFE MUTE", "lfe_muted", "Mute the subwoofer output channel."),
             ]),
             ("AUDIO ENHANCE", [
@@ -920,7 +926,6 @@ class UpmixerWindow(QMainWindow):
         is_spk = (current_mode == 'speakers')
         is_hp = (current_mode == 'headphones')
 
-        is_spectral = getattr(app, 'spectral_upmix', False)
         is_cinema = getattr(app, 'cinema_steering', False)
         ch = app.max_output_ch
         is_stereo = (ch <= 2)
@@ -947,7 +952,7 @@ class UpmixerWindow(QMainWindow):
                 getattr(self, s_name).setDisabled(is_bypass)
 
         if hasattr(self, 'radar'):
-            self.radar.setDisabled(is_bypass or (is_cinema and not is_spectral) or is_stereo or is_hp)
+            self.radar.setDisabled(is_bypass or is_stereo or is_hp)
 
         secondary_enabled = getattr(app, 'secondary_output_enabled', False)
         secondary_controls = [
@@ -964,13 +969,6 @@ class UpmixerWindow(QMainWindow):
 
         if is_bypass:
             return
-
-        # 2. Classic cinema steering replaces the manual steering sliders
-        #    (the spectral engine keeps using them alongside steering)
-        if is_cinema and not is_spectral:
-            for s_name in ['sld_spread', 'sld_side_gain', 'sld_width']:
-                if hasattr(self, s_name):
-                    getattr(self, s_name).setDisabled(True)
 
         # 3. Stereo output disables surround features
         if is_stereo:

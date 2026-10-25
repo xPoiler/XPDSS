@@ -280,24 +280,56 @@ def configure_upmix(engine, **flags):
         setattr(engine, k, v)
 
 
-def test_upmix_sends_mono_to_center_and_side_to_surrounds(engine):
+def _new_engine(tmp_path, name):
+    app = aa.AudioBypass("CABLE Output", "AVR", simulation=True, config_file=str(tmp_path / f"{name}.json"))
+    app.current_channels = 8
+    app.is_multichannel_detected = False
+    configure_upmix(app)
+    return app
+
+
+def test_classic_upmix_placement(engine, tmp_path):
+    """Common -> center, hard-panned -> its own front only, uncorrelated -> surrounds."""
     configure_upmix(engine)
     s = tone(1000, 0.5)
-    mono = upmix(engine, src8(s, s))
-    anti = upmix(engine, src8(s, -s))
-    tail = slice(SR // 4, SR // 2)
+    tail = slice(SR // 2, SR)
+    mono = upmix(engine, src8(np.tile(s, 2), np.tile(s, 2)))
     assert rms_db(mono[tail, 2]) > rms_db(mono[tail, 0]) + 20   # mono -> center
     for ch in (4, 5, 6, 7):
         assert rms_db(mono[tail, ch]) < -60                     # mono: no surrounds
-    assert rms_db(anti[tail, 2]) < -60                          # side -> no center
-    assert rms_db(anti[tail, 6]) > -20                          # 7.1 sides (Windows 6/7)
-    assert rms_db(anti[tail, 6]) > rms_db(anti[tail, 4])        # backs (4/5) get less
-    # same polarity, decorrelated: for broadband side content the surround
-    # pair is neither an inverted copy (old classic: -1.00) nor a plain copy
-    n = (np.random.default_rng(7).standard_normal(SR) * 0.1).astype(np.float32)
-    wide = upmix(engine, src8(n, -n))[SR // 4:]
+
+    engine = _new_engine(tmp_path, "left")
+    left = upmix(engine, src8(np.tile(s, 2), np.zeros(SR, dtype=np.float32)))
+    assert rms_db(left[tail, 0]) == pytest.approx(rms_db(np.tile(s, 2)[tail]) + 20 * np.log10(engine.CLASSIC_MATCH_GAIN), abs=0.5)
+    for ch in (1, 2, 4, 5, 6, 7):                               # never an inverted copy elsewhere
+        assert rms_db(left[tail, ch]) < -60
+
+    engine = _new_engine(tmp_path, "wide")
+    rng = np.random.default_rng(7)
+    a, b = (rng.standard_normal((2, SR)) * 0.1).astype(np.float32)
+    wide = upmix(engine, src8(a, b))[SR // 4:]
+    assert rms_db(wide[:, 6]) > rms_db(wide[:, 4])              # 7.1: sides (6/7) > backs (4/5)
+    assert rms_db(wide[:, 6]) > rms_db(wide[:, 0]) - 6          # ambience reaches the surrounds
+    assert rms_db(wide[:, 2]) < rms_db(wide[:, 0]) - 20         # no ambience in the center
     sl, sr = wide[:, 6], wide[:, 7]
     assert abs(np.dot(sl, sr) / np.sqrt(np.dot(sl, sl) * np.dot(sr, sr))) < 0.3
+
+
+def test_classic_opposite_phase_needs_steering(engine, tmp_path):
+    """Without steering opposite-phase content stays in L/R (as mixed); with
+    cinema steering it becomes a same-polarity rear source."""
+    configure_upmix(engine)
+    n = (np.random.default_rng(5).standard_normal(SR) * 0.1).astype(np.float32)
+    tail = slice(SR // 2, None)
+    off = upmix(engine, src8(n, -n))
+    for ch in (2, 4, 5, 6, 7):
+        assert rms_db(off[tail, ch]) < -60
+    engine = _new_engine(tmp_path, "steer")
+    engine.cinema_steering = True
+    on = upmix(engine, src8(n, -n))
+    assert rms_db(on[tail, 0]) < rms_db(on[tail, 6]) - 15   # what remains is the bass (< 200 Hz stays in L/R)
+    sl, sr = on[tail, 6], on[tail, 7]
+    assert np.dot(sl, sr) / np.sqrt(np.dot(sl, sl) * np.dot(sr, sr)) > 0.9
 
 
 def test_center_extraction_off_folds_center_into_fronts(engine):
@@ -307,7 +339,7 @@ def test_center_extraction_off_folds_center_into_fronts(engine):
     tail = slice(SR // 4, SR // 2)
     assert rms_db(out[tail, 2]) < -60
     match_db = 20 * np.log10(engine.CLASSIC_MATCH_GAIN)  # classic/spectral level match
-    assert rms_db(out[tail, 0]) == pytest.approx(rms_db(s[tail]) - 6.0 + match_db, abs=0.5)
+    assert rms_db(out[tail, 0]) == pytest.approx(rms_db(s[tail]) + match_db, abs=0.5)
 
 
 def test_stage_equalizer_lowers_center_by_3db(engine):
