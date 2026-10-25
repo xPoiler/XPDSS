@@ -14,6 +14,7 @@ import numpy as np
 import json
 from adaptive_control import ADAPTIVE_PARAMS, AdaptiveController
 from adaptive_renderer import AdaptiveFeatureEngine
+from ai_separation import AIController
 from room_expansion import RoomExpander
 from spectral_upmix import STEER_CINEMA, STEER_GAMING, STEER_OFF, SpectralUpmixer
 from xpdss_state import (
@@ -3553,6 +3554,13 @@ class AudioBypass:
             mode = 'pass_d' if spectral else 'pass'
         else:
             mode = 'spectral' if spectral else 'upmix'
+        # AI music mode: once its model runs, it takes over the upmix
+        ai = self._ai_controller()
+        ai.ensure(bool(getattr(self, 'ai_music_mode', False)) and not is_passthrough and out_ch > 2,
+                  self.sample_rate)
+        if not is_passthrough and out_ch > 2 and getattr(self, 'ai_music_mode', False) \
+                and ai.state == "ready" and ai.separator is not None:
+            mode = 'ai'
 
         if is_passthrough and self.is_multichannel_detected:
             if self.last_mode != "PASSTHROUGH_DISCRETE":
@@ -3561,7 +3569,7 @@ class AudioBypass:
         elif is_passthrough:
             self.last_mode = "PASSTHROUGH_STEREO"
         elif self.last_mode != mode:
-            engine = "Spectral" if mode == 'spectral' else "Classic"
+            engine = {"spectral": "Spectral", "ai": "AI music"}.get(mode, "Classic")
             print(f"\n[MODE] UPMIXING ({engine} - {out_ch} ch)")
             self.last_mode = mode
 
@@ -3580,9 +3588,10 @@ class AudioBypass:
         # The spectral engine runs once per block whenever the current route,
         # or the one being faded out, needs it.
         spectral_modes = ('spectral', 'pass_d')
-        if mode in spectral_modes or getattr(self, '_route_fade_from', None) in spectral_modes:
+        fade_from = getattr(self, '_route_fade_from', None)
+        if mode in spectral_modes or fade_from in spectral_modes:
             self._prepare_spectral_block(src_block, out_ch)
-        else:
+        elif mode != 'ai' and fade_from != 'ai':     # the AI route runs the engine itself
             self._spectral_was_active = False
 
         self._route(mode, src_block, out_block, out_ch)
@@ -3697,8 +3706,91 @@ class AudioBypass:
             self._route_passthrough(self._spec_delayed_src, out_block, out_ch)
         elif mode == 'spectral':
             self._route_spectral(out_block, out_ch)
+        elif mode == 'ai':
+            self._route_ai(src_block, out_block, out_ch)
         else:
             self._route_upmix(src_block, out_block, out_ch)
+
+    # ─── AI music mode ──────────────────────────────────────────────────
+
+    def _ai_controller(self):
+        ctl = getattr(self, '_ai', None)
+        if ctl is None:
+            ctl = self._ai = AIController()
+        return ctl
+
+    def _route_ai(self, src_block, out_block, out_ch):
+        """Stem-based upmix (AI music mode), delayed by the separator latency.
+
+        Conservative rendering: the speakers add up to the original mix (what
+        the model did not assign - including the band above 22 kHz it cannot
+        see - stays in the fronts), so separation errors largely cancel at the
+        listening position:
+          vocals (mid) -> centre; vocal width / reverb -> L/R and, partly,
+            the side surrounds (the voice's space around you, voice in front)
+          drums, bass -> L/R as mixed
+          other (guitars, keys, synths...) -> L/R and toward the side
+            surrounds by Instrument Spread
+        The spectral engine runs on the same delayed audio without its own
+        source moves: it supplies the LFE, the surround ambience (Envelopment,
+        IMMERSIVE) and the fallback whenever a stem block is not ready in time
+        (crossfaded, same timing). Stems are aligned to its 1024-sample latency.
+        """
+        sep = self._ai.separator
+        frames = src_block.shape[0]
+        fed = getattr(self, '_ai_fed', None)
+        if fed is None or getattr(self, '_ai_sep_id', None) != id(sep):
+            self._ai_sep_id = id(sep)
+            fed = 0
+            self._ai_delay = np.zeros((sep.latency, src_block.shape[1]), dtype=np.float32)
+            self._spectral_was_active = False                 # restart the engine on the new timeline
+        sep.feed(src_block[:, :2])
+        self._ai_fed = fed + frames
+        ext = np.concatenate((self._ai_delay, src_block.astype(np.float32)))
+        delayed = ext[:frames]
+        self._ai_delay = ext[frames:]
+
+        # spectral engine on the delayed audio: ambience, LFE, fallback
+        self._prepare_spectral_block(delayed, out_ch, placement=False)
+        self._route_spectral(out_block, out_ch)
+        spec_lat = self._spectral.latency
+        start = fed - sep.latency - spec_lat
+        mix_d = self._spec_delayed_src[:, :2]                # = input delayed by latency + spec_lat
+
+        stems = sep.pull(start, frames) if start >= 0 else None
+        prev = getattr(self, '_last_ai_mix', 0.0)
+        r = self._get_ramp('_last_ai_mix', 1.0 if stems is not None else 0.0, frames)
+        if stems is None:
+            if prev == 0.0:
+                return
+            stems = getattr(self, '_ai_last_stems', None)
+            if stems is None or stems.shape[2] != frames:
+                return
+        self._ai_last_stems = stems
+        drums, bass, other, vocals = stems
+        res = mix_d.T - stems.sum(axis=0)                     # what the model left out
+        v_mid = 0.5 * (vocals[0] + vocals[1])
+        v_side = 0.5 * (vocals[0] - vocals[1])
+        spread = float(np.clip(getattr(self, 'ai_instrument_spread', 0.6), 0.0, 1.0)) * (math.pi / 2) * 0.75
+        cs, sn = math.cos(spread), math.sin(spread)
+        vs_c, vs_s = math.cos(spread * 0.6), math.sin(spread * 0.6)
+        g = self.CLASSIC_MATCH_GAIN
+        fl = (drums[0] + bass[0] + res[0] + vs_c * v_side + cs * other[0]) * g
+        fr = (drums[1] + bass[1] + res[1] - vs_c * v_side + cs * other[1]) * g
+        if self.center_extraction:
+            c = math.sqrt(2.0) * v_mid * g
+        else:
+            c = 0.0
+            fl = fl + v_mid * g
+            fr = fr + v_mid * g
+        c_w = 0.707 if self.stage_equalizer else 1.0
+        out_block[:, 0] = out_block[:, 0] * (1.0 - r) + fl * r
+        out_block[:, 1] = out_block[:, 1] * (1.0 - r) + fr * r
+        out_block[:, 2] = out_block[:, 2] * (1.0 - r) + c * c_w * r
+        sides = (6, 7) if out_ch >= 8 else (4, 5)
+        s_gain = 10 ** (self.side_gain_db / 20.0) * g
+        out_block[:, sides[0]] += (sn * other[0] + vs_s * v_side) * r * s_gain
+        out_block[:, sides[1]] += (sn * other[1] - vs_s * v_side) * r * s_gain
 
     # ─── Spectral upmix engine ──────────────────────────────────────────
 
@@ -3718,8 +3810,12 @@ class AudioBypass:
         store[key] = ext[block.shape[0]:].copy()
         return ext[:block.shape[0]]
 
-    def _prepare_spectral_block(self, src_block, out_ch=8):
-        """Run the spectral analysis/resynthesis exactly once per block."""
+    def _prepare_spectral_block(self, src_block, out_ch=8, placement=True):
+        """Run the spectral analysis/resynthesis exactly once per block.
+
+        placement=False (AI music mode): no steering, wrap or side moves - the
+        stems place the sources; the engine supplies ambience and fallback.
+        """
         engine = getattr(self, '_spectral', None)
         if engine is None or engine.sample_rate != int(self.sample_rate):
             engine = self._spectral = SpectralUpmixer(self.sample_rate)
@@ -3730,7 +3826,7 @@ class AudioBypass:
             self._spectral_was_active = True
         width = self.width_factor
         # Cinema / gaming steering: front/back placement from L/R phase
-        if getattr(self, 'cinema_steering', False):
+        if getattr(self, 'cinema_steering', False) and placement:
             steering = STEER_GAMING if getattr(self, 'gaming_panning', False) else STEER_CINEMA
         else:
             steering = STEER_OFF
@@ -3739,9 +3835,9 @@ class AudioBypass:
             center=self.center_extraction, steering=steering,
             split_sides_backs=out_ch >= 8,
             envelopment=getattr(self, 'envelopment', 0.0),
-            wrap=getattr(self, 'wrap_amount', 0.0),
-            hard_pan_sides=bool(getattr(self, 'hard_pan_sides', False)),
-            wide_sides=bool(getattr(self, 'wide_stereo_sides', False))).astype(np.float32)
+            wrap=getattr(self, 'wrap_amount', 0.0) if placement else 0.0,
+            hard_pan_sides=bool(getattr(self, 'hard_pan_sides', False)) and placement,
+            wide_sides=bool(getattr(self, 'wide_stereo_sides', False)) and placement).astype(np.float32)
         self._spec_delayed_src = self._delay_block('spec_src', src_block, engine.latency)
 
     def _route_spectral(self, out_block, out_ch):

@@ -526,6 +526,13 @@ class UpmixerWindow(QMainWindow):
                  "the ~1.5 kHz dip a phantom centre has at the ears, so voices moved there\n"
                  "sound forward and lean. This restores the tonal balance of the mix\n"
                  "(+2 dB low shelf at 500 Hz, -2.5 dB at 1.5 kHz on the centre)."),
+                ("AI MUSIC MODE", "ai_music_mode",
+                 "Stem separation (HTDemucs neural network) for music: vocals in the centre,\n"
+                 "drums and bass in front, other instruments spread toward the sides, the\n"
+                 "ambience around you. Adds ~1 s of delay (music, not video/games).\n"
+                 "Runs on the GPU (DirectML); falls back to the spectral upmix whenever the\n"
+                 "model is not ready. Switching it on/off jumps by the delay once.\n"
+                 "Needs a one-time 304 MB model download (button below)."),
                 ("STAGE EQUALIZER", "stage_equalizer", "Balance front/surround weight."),
                 ("CENTER FOCUS", "center_extraction", "Extract dialogue to center speaker."),
                 ("CINEMA STEERING", "cinema_steering",
@@ -631,6 +638,23 @@ class UpmixerWindow(QMainWindow):
                                         "(50% = ~1 s, 100% = bigger hall ~1.6 s and +6 dB).")
         self.sld_room_amount.valueChanged.connect(lambda v: (setattr(self.audio_app, "room_amount", v / 100.0), self.request_save()))
         right_panel.addWidget(self.sld_room_amount)
+
+        self.sld_ai_spread = LabeledSlider("AI Instrument Spread", 0.0, 100.0, getattr(audio_app, 'ai_instrument_spread', 0.6) * 100.0, suffix="%", is_int=True)
+        self.sld_ai_spread.setToolTip("AI music mode: how far the instruments (the 'other' stem: guitars, keys,\n"
+                                      "synths) and the vocal ambience move from the fronts toward the sides.")
+        self.sld_ai_spread.valueChanged.connect(lambda v: (setattr(self.audio_app, "ai_instrument_spread", v / 100.0), self.request_save()))
+        right_panel.addWidget(self.sld_ai_spread)
+
+        ai_row = QHBoxLayout()
+        self.lbl_ai = QLabel("AI: off")
+        self.lbl_ai.setStyleSheet("color: #777; font-size: 10px;")
+        self.btn_ai_download = QPushButton("DOWNLOAD AI MODEL")
+        self.btn_ai_download.setToolTip("One-time download of the HTDemucs model (304 MB, MIT licence) from Hugging Face,\n"
+                                        "verified by SHA-256, stored in the app's 'models' folder.")
+        self.btn_ai_download.clicked.connect(lambda: self.audio_app._ai_controller().download())
+        ai_row.addWidget(self.lbl_ai, 1)
+        ai_row.addWidget(self.btn_ai_download)
+        right_panel.addLayout(ai_row)
 
         self.sld_sub_gain = LabeledSlider("Sub Gain", 0.0, 5.0, audio_app.sub_gain, suffix="x")
         self.sld_sub_gain.valueChanged.connect(lambda v: (setattr(self.audio_app, "sub_gain", v), self.request_save()))
@@ -952,6 +976,7 @@ class UpmixerWindow(QMainWindow):
             'sld_envelopment': ('envelopment', lambda v: v * 100.0),
             'sld_wrap': ('wrap_amount', lambda v: v * 100.0),
             'sld_room_amount': ('room_amount', lambda v: v * 100.0),
+            'sld_ai_spread': ('ai_instrument_spread', lambda v: v * 100.0),
             'sld_sub_gain': ('sub_gain', None),
             'sld_sub_low': ('sub_low_cutoff', None),
             'sld_sub_cutoff': ('sub_drive_cutoff', None),
@@ -1027,7 +1052,7 @@ class UpmixerWindow(QMainWindow):
             for b in self.option_buttons.values():
                 b.setDisabled(is_bypass)
 
-        all_sliders = ['sld_spread', 'sld_width', 'sld_side_gain', 'sld_envelopment', 'sld_wrap', 'sld_room_amount', 'sld_sub_gain', 'sld_sub_cutoff',
+        all_sliders = ['sld_spread', 'sld_width', 'sld_side_gain', 'sld_envelopment', 'sld_wrap', 'sld_room_amount', 'sld_ai_spread', 'sld_sub_gain', 'sld_sub_cutoff',
                        'sld_sub_low', 'sld_transient', 'sld_micro_dyn', 'sld_clarity', 'sld_room_mix', 'sld_air',
                        'sld_trans_delay', 'sld_trans_gain', 'sld_trans_feedback',
                        'sld_speaker_width', 'sld_camera_fov', 'sld_speaker_dist', 'sld_room_width']
@@ -1064,6 +1089,8 @@ class UpmixerWindow(QMainWindow):
                 self.option_buttons[key].setEnabled(is_spectral and not is_stereo)
         if hasattr(self, 'sld_room_amount'):
             self.sld_room_amount.setDisabled(not getattr(app, 'immersive', False) or is_stereo)
+        if hasattr(self, 'sld_ai_spread'):
+            self.sld_ai_spread.setDisabled(not getattr(app, 'ai_music_mode', False) or is_stereo)
         if 'immersive' in self.option_buttons:
             self.option_buttons['immersive'].setEnabled(not is_stereo)
 
@@ -1085,7 +1112,7 @@ class UpmixerWindow(QMainWindow):
         # 4. Mode-exclusive visibility
         speaker_only = ['transaural_widening', 'cinema_steering', 'gaming_panning', 'stage_equalizer', 'spectral_upmix',
                         'head_tracking', 'center_extraction', 'lfe_muted', 'vocal_lock', 'freq_dep_width',
-                        'immersive', 'hard_pan_sides', 'wide_stereo_sides', 'center_match']
+                        'immersive', 'hard_pan_sides', 'wide_stereo_sides', 'center_match', 'ai_music_mode']
         headphone_only = ['head_shadow_eq', 'headphone_tracking', 'hp_externalization']
 
         for f in speaker_only:
@@ -1260,6 +1287,18 @@ class UpmixerWindow(QMainWindow):
                     f"input buffer {1000.0 * getattr(self.audio_app, 'target_latency_samples', 0) / max(1, self.audio_app.sample_rate):.0f} ms")
             if text != self.lbl_health.text():
                 self.lbl_health.setText(text)
+
+        if hasattr(self, 'lbl_ai'):
+            ctl = self.audio_app._ai_controller()
+            if not getattr(self.audio_app, 'ai_music_mode', False) and ctl.state in ("off", "missing"):
+                from ai_separation import model_ok
+                t = "AI: model ready" if model_ok(ctl.model_path) else "AI: model not downloaded (304 MB)"
+            else:
+                t = ctl.status_text
+            if t != self.lbl_ai.text():
+                self.lbl_ai.setText(t)
+            from ai_separation import model_ok as _mok
+            self.btn_ai_download.setVisible(not _mok(ctl.model_path) and ctl.state != "downloading")
 
         self._update_adaptive_display()
 

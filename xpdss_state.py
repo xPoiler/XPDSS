@@ -22,6 +22,8 @@ PROFILE_DEFAULTS: Dict[str, Any] = {
     "wide_stereo_sides": False,  # spectral: stereo-widened sources play from the side surrounds
     "center_match": False,    # phantom-matched centre tonality
     "room_amount": 0.5,       # IMMERSIVE room expansion size/level
+    "ai_music_mode": False,   # stem separation (HTDemucs) based upmix, ~1 s delay on a GPU
+    "ai_instrument_spread": 0.6,  # AI mode: how far the "other" stem goes toward the side surrounds
     "dynamic_eq": False,
     "cinema_steering": False,
     "gaming_panning": False,
