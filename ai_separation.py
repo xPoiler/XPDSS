@@ -67,25 +67,52 @@ def download_model(path: str, progress=None) -> None:
     os.replace(tmp, path)
 
 
-def make_session(path: str, prefer_gpu: bool = True):
-    """ONNX Runtime session: DirectML / CUDA when available, else CPU."""
+# Providers tried in order; each must pass a real test run on the model.
+# DirectML's vendor "metacommands" can fail on some ConvTranspose layers of
+# the decoder (seen on an RTX 3060 Ti), hence the second DirectML attempt.
+PROVIDER_CHAIN = (
+    ("CUDA", "CUDAExecutionProvider", {}),
+    ("DirectML", "DmlExecutionProvider", {}),
+    ("DirectML (no metacommands)", "DmlExecutionProvider", {"disable_metacommands": "true"}),
+    ("CPU", "CPUExecutionProvider", {}),
+)
+
+
+def _preload_gpu_libraries() -> None:
+    """Make CUDA/cuDNN installed as pip packages (onnxruntime-gpu[cuda,cudnn])
+    loadable; harmless when they are absent."""
+    try:
+        import onnxruntime as ort
+        if hasattr(ort, "preload_dlls"):
+            ort.preload_dlls()
+    except Exception:
+        pass
+
+
+def make_session(path: str, provider: str = "CPUExecutionProvider", options: dict | None = None):
+    """ONNX Runtime session on one provider (CPU kept as fallback for single
+    unsupported nodes). Raises if the requested provider did not load."""
     import onnxruntime as ort
-    avail = ort.get_available_providers()
-    providers = []
-    if prefer_gpu:
-        for p in ("CUDAExecutionProvider", "DmlExecutionProvider"):
-            if p in avail:
-                providers.append(p)
-    providers.append("CPUExecutionProvider")
     so = ort.SessionOptions()
     so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
     # leave cores for the audio thread and the rest of the system
     so.intra_op_num_threads = max(1, (os.cpu_count() or 4) - 2)
-    if "DmlExecutionProvider" in providers:
+    if provider == "DmlExecutionProvider":
         so.enable_mem_pattern = False
         so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    providers = [(provider, dict(options or {}))]
+    if provider != "CPUExecutionProvider":
+        providers.append("CPUExecutionProvider")
     sess = ort.InferenceSession(path, so, providers=providers)
-    return sess, sess.get_providers()[0]
+    if sess.get_providers()[0] != provider:
+        raise RuntimeError(f"{provider} did not load (got {sess.get_providers()[0]})")
+    return sess
+
+
+def available_chain():
+    import onnxruntime as ort
+    avail = set(ort.get_available_providers())
+    return [c for c in PROVIDER_CHAIN if c[1] in avail]
 
 
 class StreamingSeparator:
@@ -273,6 +300,7 @@ class AIController:
         self.detail = ""
         self.separator: StreamingSeparator | None = None
         self.provider = None
+        self.failures = []
         self._lock = threading.Lock()
         self._busy = False
 
@@ -280,9 +308,10 @@ class AIController:
     def status_text(self) -> str:
         if self.state == "ready" and self.separator is not None:
             s = self.separator
-            return (f"AI: running on {self.provider.replace('ExecutionProvider', '')}, "
+            return (f"AI: running on {self.provider}, "
                     f"{s.compute_s * 1000:.0f} ms per window, delay {s.latency / s.sr:.2f} s"
-                    + (f", fallbacks {s.misses}" if s.misses else ""))
+                    + (f", fallbacks {s.misses}" if s.misses else "")
+                    + (" (skipped: " + ", ".join(f.split(":")[0] for f in self.failures) + ")" if self.failures else ""))
         return {"off": "AI: off", "missing": "AI: model not downloaded (304 MB)",
                 "downloading": f"AI: downloading model {self.detail}", "loading": "AI: loading model...",
                 "error": f"AI: error - {self.detail}"}.get(self.state, self.state)
@@ -325,20 +354,37 @@ class AIController:
         threading.Thread(target=run, name="ai-controller", daemon=True).start()
 
     def _load(self, sample_rate: int) -> None:
+        """Try each available provider in order with a real test run; the first
+        that works is used (a failure only moves on to the next one)."""
+        self.state = "loading"
+        failures = []
+        if any(c[1] == "CUDAExecutionProvider" for c in PROVIDER_CHAIN):
+            _preload_gpu_libraries()
         try:
-            self.state = "loading"
-            sess, self.provider = make_session(self.model_path)
-            probe = StreamingSeparator(sample_rate, session=sess)
-            compute = probe.warm_up(3)
+            chain = available_chain()
+        except Exception as e:
+            self.state, self.detail = "error", f"ONNX Runtime not installed ({e})"
+            return
+        for name, provider, options in chain:
+            try:
+                sess = make_session(self.model_path, provider, options)
+                probe = StreamingSeparator(sample_rate, session=sess)
+                compute = probe.warm_up(3)
+            except Exception as e:
+                failures.append(f"{name}: {str(e).splitlines()[0][:120]}")
+                continue
             hop_s = max(0.25, 1.3 * compute)          # keep up with the hardware
             sep = StreamingSeparator(sample_rate, session=sess, hop_s=hop_s, xfade_s=0.05)
             sep.compute_s = compute
             sep.latency = sep.latency_for(compute)
             sep.start()
+            self.provider, self.failures = name, failures
             self.separator = sep
             self.state = "ready"
-        except Exception as e:
-            self.state, self.detail = "error", f"{type(e).__name__}: {e}"
+            if failures:
+                print("[AI] fell back past: " + " | ".join(failures))
+            return
+        self.state, self.detail = "error", "no provider worked: " + " | ".join(failures)
 
     def _unload(self) -> None:
         sep, self.separator = self.separator, None

@@ -86,3 +86,31 @@ def test_ai_route_places_stems_and_falls_back_without_gaps(tmp_path):
     # the centred "vocal" share (fake vocals = 0.4 of the mix) is in the centre
     seg = out[lat + SR:lat + SR + SR]
     assert (seg[:, 2] ** 2).sum() > 0.2 * (seg[:, [0, 1, 2]] ** 2).sum()
+
+
+def test_controller_falls_back_when_a_provider_fails_at_runtime(tmp_path, monkeypatch):
+    """DirectML failed on a ConvTranspose layer on an RTX 3060 Ti: a provider
+    that fails its test run must hand over to the next one, not stop."""
+    model = tmp_path / "m.onnx"
+    model.write_bytes(b"x")
+    monkeypatch.setattr(A, "model_ok", lambda p: True)
+    monkeypatch.setattr(A, "available_chain", lambda: [("DirectML", "Dml", {}), ("CPU", "Cpu", {})])
+
+    class Sess:
+        def __init__(self, name): self.name = name
+
+    monkeypatch.setattr(A, "make_session", lambda path, provider, options: Sess(provider))
+
+    def run(self, mix44):
+        if self.session.name == "Dml":
+            raise RuntimeError("Non-zero status code returned while running ConvTranspose node")
+        return np.stack([mix44 * g for g in (0.1, 0.2, 0.3, 0.4)])
+
+    monkeypatch.setattr(A.StreamingSeparator, "_run_model", run)
+    ctl = A.AIController(model_path=str(model))
+    ctl._load(SR)
+    try:
+        assert ctl.state == "ready" and ctl.provider == "CPU"
+        assert ctl.failures and "ConvTranspose" in ctl.failures[0]
+    finally:
+        ctl._unload()
