@@ -3904,7 +3904,7 @@ class AudioBypass:
         if out_ch > 3:
             lfe = (d_src[:, 0] + d_src[:, 1]) * 0.316
             if getattr(self, 'dynamic_eq', False):
-                safe_level = max(getattr(self, 'dyn_eq_level', 0.0), float(np.max(np.abs(d_src))))
+                safe_level = self._dyn_eq_safe_level(d_src)
                 boost_factor = 1.0 + (1.0 - min(1.0, safe_level * 2.0)) * 0.58
                 lfe = lfe * self._get_ramp('_last_spec_dyn', boost_factor, frames)
             out_block[:, 3] = 0.0 if self.lfe_muted else lfe
@@ -3922,6 +3922,21 @@ class AudioBypass:
             out_block[:, 4] = amb_sl + side_l
             out_block[:, 5] = amb_sr + side_r
         self._immersive_room((d_src[:, 0] + d_src[:, 1]) * 0.5, out_ch, out_block)
+
+    def _dyn_eq_safe_level(self, block):
+        """Dynamic EQ level (instant attack, ~2.5 s release) tracked on the
+        audio the route actually plays: the analysis-thread tracker follows
+        the undelayed input, so in delayed routes (spectral 21 ms, AI ~1 s)
+        the sub boost changed before the music did."""
+        peak = float(np.max(np.abs(block[:, :2]))) if block.size else 0.0
+        level = getattr(self, '_dyn_eq_track', 0.0)
+        if peak > level:
+            level = peak
+        else:
+            rel = 1.0 - 0.99 ** (block.shape[0] / (480.0 * ANALYSIS_STRIDE))
+            level = level + rel * (peak - level)
+        self._dyn_eq_track = level
+        return level
 
     def _ambience_front_rear(self):
         """Front and surround ambience gains from the radar's Y.
@@ -4111,7 +4126,7 @@ class AudioBypass:
 
         # Apply Safe Dynamic EQ if enabled and LFE exists (Stereo passthrough won't have out_ch > 3)
         if out_ch > 3 and getattr(self, 'dynamic_eq', False):
-            safe_level = max(getattr(self, 'dyn_eq_level', 0.0), np.max(np.abs(src_block)))
+            safe_level = self._dyn_eq_safe_level(src_block)
             boost_factor = 1.0 + (1.0 - min(1.0, safe_level * 2.0)) * 0.58
             ramp = self._get_ramp('_last_pass_dyn', boost_factor, frames)
             out_block[:, 3] *= ramp
@@ -4273,8 +4288,8 @@ class AudioBypass:
         # Adds up to +4dB (1.58x) boost at extreme low volumes, tapering to 0dB at 0.5 peak
         if getattr(self, 'dynamic_eq', False):
             # We use a linear ramp that maxes at +4dB boost
-            # dyn_eq_level is 0.0 to 1.0 (average peak)
-            safe_level = max(getattr(self, 'dyn_eq_level', 0.0), np.max(np.abs(src_block)))
+            # level tracker 0.0 to 1.0 (peak, fast attack / slow release)
+            safe_level = self._dyn_eq_safe_level(src_block)
             boost_factor = 1.0 + (1.0 - min(1.0, safe_level * 2.0)) * 0.58
             ramp = self._get_ramp('_last_up_dyn', boost_factor, LFE.shape[0])
             LFE *= ramp

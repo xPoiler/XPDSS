@@ -178,3 +178,36 @@ def test_subharmonic_synth_is_time_aligned_with_delayed_routes(tmp_path, ai):
     synth_on = np.argmax(np.abs(synth).max(axis=1) > 0.005)
     assert synth.any()
     assert synth_on >= front_on - int(0.002 * SR)   # never before the note it belongs to
+
+
+def test_dynamic_eq_sub_boost_follows_the_delayed_audio(tmp_path):
+    """The LFE boost of Dynamic EQ must change when the loud passage is
+    heard, not when it enters the (delayed) AI route."""
+    t = np.arange(SR * 5) / SR
+    x = np.zeros((len(t), 8), np.float32)
+    loud_at = SR * 3
+    amp = np.where(np.arange(len(t)) < loud_at, 0.02, 0.6).astype(np.float32)
+    x[:, 0] = x[:, 1] = amp * np.sin(2 * np.pi * 50 * t)
+
+    def render(dyn):
+        sep = A.StreamingSeparator(SR, run_fn=FAKE)
+        sep.compute_s = 0.0
+        sep.latency = sep.latency_for(0.0)
+        app = _ai_engine(tmp_path, sep)
+        app.dynamic_eq = dyn
+        outs = []
+        for bi, i in enumerate(range(0, len(x), 480)):
+            if bi % 5 == 0:     # what the analysis thread does with the (undelayed) input
+                peak = float(np.abs(x[i:i + 480, :2]).max())
+                app.dyn_eq_level = peak if peak > app.dyn_eq_level else app.dyn_eq_level * 0.99 + peak * 0.01
+            outs.append(app._apply_upmix(x[i:i + 480].copy(), out_ch=6).copy())
+            while sep.step():
+                pass
+        return np.concatenate(outs), sep.latency
+
+    on, lat = render(True)
+    off, _ = render(False)
+    heard = loud_at + lat + 1024 + 72                       # when the loud part plays
+    pre = slice(heard - SR // 4, heard - SR // 20)          # still the quiet passage
+    boost = np.sqrt((on[pre, 3] ** 2).mean() / (off[pre, 3] ** 2).mean())
+    assert boost == pytest.approx(1.0 + (1.0 - 0.04) * 0.58, rel=0.05)   # full quiet-level boost
