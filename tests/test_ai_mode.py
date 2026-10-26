@@ -144,3 +144,37 @@ def test_switching_ai_off_keeps_playing(tmp_path):
     assert not errors
     tail = np.concatenate(outs[220:])
     assert np.sqrt((tail[:, :3] ** 2).mean()) > 0.02
+
+
+@pytest.mark.parametrize("ai", [False, True])
+def test_subharmonic_synth_is_time_aligned_with_delayed_routes(tmp_path, ai):
+    """The sub synth read the undelayed input: in spectral mode its sub came
+    21 ms early, in AI mode ~1 s early (a bass 'pre-echo')."""
+    def render(sub_on):
+        if ai:
+            sep = A.StreamingSeparator(SR, run_fn=FAKE)
+            sep.compute_s = 0.0
+            sep.latency = sep.latency_for(0.0)
+            app = _ai_engine(tmp_path, sep)
+        else:
+            app = aa.AudioBypass("a", "b", simulation=True, config_file=str(tmp_path / "s.json"))
+            app.current_channels = 6
+            app.upmix_enabled = app.spectral_upmix = app.center_extraction = True
+            sep = None
+        app.sub_synth = sub_on
+        t = np.arange(SR * 4) / SR
+        x = np.zeros((len(t), 8), np.float32)
+        on = SR * 2
+        x[on:, 0] = x[on:, 1] = 0.4 * np.sin(2 * np.pi * 60 * t[on:])     # bass note at 2 s
+        outs = []
+        for i in range(0, len(x), 480):
+            outs.append(app._apply_upmix(x[i:i + 480].copy(), out_ch=6).copy())
+            while sep is not None and sep.step():
+                pass
+        return np.concatenate(outs)
+    with_sub, without = render(True), render(False)
+    synth = with_sub - without                     # what the synth added
+    front_on = np.argmax(np.abs(without[:, 0]) > 0.01)
+    synth_on = np.argmax(np.abs(synth).max(axis=1) > 0.005)
+    assert synth.any()
+    assert synth_on >= front_on - int(0.002 * SR)   # never before the note it belongs to

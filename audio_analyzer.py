@@ -3646,8 +3646,16 @@ class AudioBypass:
             self.is_multichannel_detected if is_passthrough else bool(self.center_extraction))
 
         # ─── Post-Upmix Effects Pipeline ───
+        # Effects that analyse the input (subharmonic synth) get it time-aligned
+        # with what is playing: the spectral, delayed-passthrough and AI routes
+        # are late by their latency (21 ms / ~1 s), and the undelayed input made
+        # the synthesised sub start that much before its bass note.
+        aligned_src = src_block
+        if mode in ('spectral', 'pass_d', 'ai') and getattr(self, '_spec_delayed_src', None) is not None \
+                and self._spec_delayed_src.shape[0] == frames:
+            aligned_src = self._spec_delayed_src
         self._apply_post_effects(out_block, out_ch, skip_subsynth=force_passthrough,
-                                 src_block=src_block, is_passthrough=is_passthrough)
+                                 src_block=aligned_src, is_passthrough=is_passthrough)
 
         # Phantom-matched centre (upmix only: the centre then holds moved content)
         if out_ch > 2 and not is_passthrough:
