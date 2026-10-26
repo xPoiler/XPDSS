@@ -1063,6 +1063,7 @@ class AudioBypass:
             self._last_callback_error = (msg, now)
         # Most DSP failures come from stale state after a format change: rebuild it.
         self._reset_dsp_state()
+        self._route_fade_from = None        # never let a broken crossfade loop
 
     # Lazily created DSP state that depends on sample rate, block size or channel count
     _DSP_STATE_ATTRS = (
@@ -3602,7 +3603,14 @@ class AudioBypass:
                 fb = self._route_fade_buf = np.zeros((max(frames, 8192), out_ch), dtype=np.float32)
             other = fb[:frames]
             other[:] = 0.0
-            self._route(self._route_fade_from, src_block, other, out_ch)
+            try:
+                self._route(self._route_fade_from, src_block, other, out_ch)
+            except Exception as e:
+                # A route that cannot render any more (e.g. AI mode unloaded)
+                # must not stall the fade: drop it and play the new route.
+                self._route_fade_from = None
+                self._report_callback_error("route fade", e)
+                other[:] = out_block
             w = np.clip((self._route_fade_pos + np.arange(1, frames + 1)) / fade_len, 0.0, 1.0).astype(np.float32)
             out_block *= w[:, np.newaxis]
             out_block += other * (1.0 - w)[:, np.newaxis]
@@ -3738,6 +3746,18 @@ class AudioBypass:
         """
         sep = self._ai.separator
         frames = src_block.shape[0]
+        if sep is None:
+            # Unloaded while the route still fades out of 'ai': keep the same
+            # delay and play the spectral fallback (no stems).
+            if getattr(self, '_ai_delay', None) is None:
+                self._route_upmix(src_block, out_block, out_ch)
+                return
+            ext = np.concatenate((self._ai_delay, src_block.astype(np.float32)))
+            delayed = ext[:frames]
+            self._ai_delay = ext[frames:]
+            self._prepare_spectral_block(delayed, out_ch, placement=False)
+            self._route_spectral(out_block, out_ch)
+            return
         fed = getattr(self, '_ai_fed', None)
         if fed is None or getattr(self, '_ai_sep_id', None) != id(sep):
             self._ai_sep_id = id(sep)

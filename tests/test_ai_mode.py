@@ -114,3 +114,33 @@ def test_controller_falls_back_when_a_provider_fails_at_runtime(tmp_path, monkey
         assert ctl.failures and "ConvTranspose" in ctl.failures[0]
     finally:
         ctl._unload()
+
+
+def test_switching_ai_off_keeps_playing(tmp_path):
+    """Turning AI mode off unloads the separator while the route is still
+    fading out of 'ai': that must never error or go silent."""
+    sep = A.StreamingSeparator(SR, run_fn=FAKE)
+    sep.compute_s = 0.0
+    sep.latency = sep.latency_for(0.0)
+    app = _ai_engine(tmp_path, sep)
+    errors = []
+    app._report_callback_error = lambda where, exc: errors.append(exc)
+    t = np.arange(SR * 4) / SR
+    x = np.zeros((len(t), 8), np.float32)
+    x[:, 0] = x[:, 1] = 0.2 * np.sin(2 * np.pi * 300 * t)
+    outs = []
+    for bi, i in enumerate(range(0, len(x), 480)):
+        if bi == 200:                               # user switches AI off...
+            app.ai_music_mode = False
+            app._ai.separator = None                # ...and the unload thread already ran
+            app._ai.state = "off"
+        try:
+            outs.append(app._apply_upmix(x[i:i + 480].copy(), out_ch=6).copy())
+        except Exception as e:                      # the real callback catches and silences
+            errors.append(e)
+            outs.append(np.zeros((480, 6), np.float32))
+        while app._ai.separator is not None and app._ai.separator.step():
+            pass
+    assert not errors
+    tail = np.concatenate(outs[220:])
+    assert np.sqrt((tail[:, :3] ** 2).mean()) > 0.02
