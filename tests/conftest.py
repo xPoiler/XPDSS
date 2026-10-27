@@ -10,6 +10,20 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def _no_system_tray(monkeypatch):
+    """Engine tests do not own a Windows tray event loop or icon lifecycle."""
+    import audio_analyzer
+    monkeypatch.setattr(audio_analyzer.AudioBypass, "_setup_tray", lambda self: None)
+
+
+@pytest.fixture(autouse=True)
+def _no_automatic_live_model_load(monkeypatch):
+    """DSP tests use deterministic models; real model timing has its own tool."""
+    import ai_live
+    monkeypatch.setattr(ai_live, 'models_present', lambda *args: False)
+
+
+@pytest.fixture(autouse=True)
 def _no_output_headroom(monkeypatch, request):
     """DSP tests check absolute levels: run them without the output headroom
     (tests that need it opt in with @pytest.mark.headroom)."""

@@ -23,6 +23,9 @@ PROFILE_DEFAULTS: Dict[str, Any] = {
     "center_match": False,    # phantom-matched centre tonality
     "room_amount": 0.5,       # IMMERSIVE room expansion size/level
     "ai_music_mode": False,   # stem separation (HTDemucs) based upmix, ~1 s delay on a GPU
+    "ai_live_mode": False,    # independent low-latency AI route; overrides Music only while on
+    "ai_enhance": False,      # optional AI-guided tone/dynamics; routing and buffers unchanged
+    "ai_enhance_amount": 0.7,  # AI Enhance strength (stem remaster on AI Live)
     "ai_instrument_spread": 0.6,  # AI mode: how far the "other" stem goes toward the side surrounds
     "dynamic_eq": False,
     "cinema_steering": False,

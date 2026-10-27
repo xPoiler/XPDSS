@@ -533,6 +533,13 @@ class UpmixerWindow(QMainWindow):
                  "Runs on the GPU (DirectML); falls back to the spectral upmix whenever the\n"
                  "model is not ready. Switching it on/off jumps by the delay once.\n"
                  "Needs a one-time 304 MB model download (button below)."),
+                ("AI LIVE", "ai_live_mode",
+                 "Low-latency AI stem upmix for stereo films, TV, games and music.\n"
+                 "Uses a separate 32 MB model, processed during input buffering. Targets\n"
+                 "about 65 ms total; source/receiver delays must also fit.\n"
+                 "Takes priority over AI Music while enabled; turning it off restores\n"
+                 "your previous route and buffering. Native surround passes through.\n"
+                 "Late or unavailable AI uses a conventional upmix at the same delay."),
                 ("STAGE EQUALIZER", "stage_equalizer", "Balance front/surround weight."),
                 ("CENTER FOCUS", "center_extraction", "Extract dialogue to center speaker."),
                 ("CINEMA STEERING", "cinema_steering",
@@ -544,6 +551,14 @@ class UpmixerWindow(QMainWindow):
                 ("LFE MUTE", "lfe_muted", "Mute the subwoofer output channel."),
             ]),
             ("AUDIO ENHANCE", [
+                ("AI ENHANCE", "ai_enhance",
+                 "With AI Live: remasters each separated stem (vocal clarity, drum punch, bass harmonics,\n"
+                 "instrument air and width) at no added latency. Other engines: AI-guided tonal balance.\n"
+                 "Works with upmix and passthrough; your selected routing and buffering stay unchanged.\n"
+                 "No additional enhancement lookahead; the selected engine keeps its existing latency.\n"
+                 "Uses the Live model; corrections depend on the content.\n"
+                 "Off removes the enhancement after a short fade.\n"
+                 "Experimental: compare on/off to choose what sounds better to you."),
                 ("DYNAMIC EQ", "dynamic_eq", "Fletcher-Munson loudness compensation."),
                 ("DIALOG FOCUS", "dialogue_focus", "Adaptive speech-presence emphasis for center/dialogue."),
                 ("VOCAL LOCK", "vocal_lock", "Detect vocals and boost center clarity."),
@@ -640,10 +655,17 @@ class UpmixerWindow(QMainWindow):
         right_panel.addWidget(self.sld_room_amount)
 
         self.sld_ai_spread = LabeledSlider("AI Instrument Spread", 0.0, 100.0, getattr(audio_app, 'ai_instrument_spread', 0.6) * 100.0, suffix="%", is_int=True)
-        self.sld_ai_spread.setToolTip("AI music mode: how far the instruments (the 'other' stem: guitars, keys,\n"
+        self.sld_ai_spread.setToolTip("AI Music / Live: how far the instruments (the 'other' stem: guitars, keys,\n"
                                       "synths) and the vocal ambience move from the fronts toward the sides.")
         self.sld_ai_spread.valueChanged.connect(lambda v: (setattr(self.audio_app, "ai_instrument_spread", v / 100.0), self.request_save()))
         right_panel.addWidget(self.sld_ai_spread)
+
+        self.sld_ai_enhance = LabeledSlider("AI Enhance Amount", 0.0, 150.0, getattr(audio_app, 'ai_enhance_amount', 0.7) * 100.0, suffix="%", is_int=True)
+        self.sld_ai_enhance.setToolTip("AI Enhance on AI Live: how strongly the separated stems are remastered\n"
+                                       "(vocal clarity and levelling, drum punch, bass harmonics, instrument air/width).\n"
+                                       "Loudness is matched, so on/off compares clarity, not volume.")
+        self.sld_ai_enhance.valueChanged.connect(lambda v: (setattr(self.audio_app, "ai_enhance_amount", v / 100.0), self.request_save()))
+        right_panel.addWidget(self.sld_ai_enhance)
 
         ai_row = QHBoxLayout()
         self.lbl_ai = QLabel("AI: off")
@@ -655,6 +677,26 @@ class UpmixerWindow(QMainWindow):
         ai_row.addWidget(self.lbl_ai, 1)
         ai_row.addWidget(self.btn_ai_download)
         right_panel.addLayout(ai_row)
+
+        live_row = QHBoxLayout()
+        self.lbl_live = QLabel("AI Live: off")
+        self.lbl_live.setWordWrap(True)
+        self.lbl_live.setToolTip("Recent AI availability shows how much of the recent audio had AI results ready.\n"
+                                 "Total late blocks is cumulative and includes blocks with only a small late fragment.\n"
+                                 "Ready fragments are kept; missing fragments blend toward ordinary upmix.")
+        self.lbl_live.setStyleSheet("color: #777; font-size: 10px;")
+        self.btn_live_download = QPushButton("DOWNLOAD LIVE MODEL")
+        self.btn_live_download.setToolTip("One-time 32 MB StemgenRT model download (MIT), verified by SHA-256.\n"
+                                         "Separate from the existing AI Music model.")
+        self.btn_live_download.clicked.connect(lambda: self.audio_app._live_controller().download())
+        live_row.addWidget(self.lbl_live, 1)
+        live_row.addWidget(self.btn_live_download)
+        right_panel.addLayout(live_row)
+
+        self.lbl_enhance = QLabel("AI Enhance: off")
+        self.lbl_enhance.setWordWrap(True)
+        self.lbl_enhance.setStyleSheet("color: #777; font-size: 10px;")
+        right_panel.addWidget(self.lbl_enhance)
 
         self.sld_sub_gain = LabeledSlider("Sub Gain", 0.0, 5.0, audio_app.sub_gain, suffix="x")
         self.sld_sub_gain.valueChanged.connect(lambda v: (setattr(self.audio_app, "sub_gain", v), self.request_save()))
@@ -977,6 +1019,7 @@ class UpmixerWindow(QMainWindow):
             'sld_wrap': ('wrap_amount', lambda v: v * 100.0),
             'sld_room_amount': ('room_amount', lambda v: v * 100.0),
             'sld_ai_spread': ('ai_instrument_spread', lambda v: v * 100.0),
+            'sld_ai_enhance': ('ai_enhance_amount', lambda v: v * 100.0),
             'sld_sub_gain': ('sub_gain', None),
             'sld_sub_low': ('sub_low_cutoff', None),
             'sld_sub_cutoff': ('sub_drive_cutoff', None),
@@ -1052,7 +1095,7 @@ class UpmixerWindow(QMainWindow):
             for b in self.option_buttons.values():
                 b.setDisabled(is_bypass)
 
-        all_sliders = ['sld_spread', 'sld_width', 'sld_side_gain', 'sld_envelopment', 'sld_wrap', 'sld_room_amount', 'sld_ai_spread', 'sld_sub_gain', 'sld_sub_cutoff',
+        all_sliders = ['sld_spread', 'sld_width', 'sld_side_gain', 'sld_envelopment', 'sld_wrap', 'sld_room_amount', 'sld_ai_spread', 'sld_ai_enhance', 'sld_sub_gain', 'sld_sub_cutoff',
                        'sld_sub_low', 'sld_transient', 'sld_micro_dyn', 'sld_clarity', 'sld_room_mix', 'sld_air',
                        'sld_trans_delay', 'sld_trans_gain', 'sld_trans_feedback',
                        'sld_speaker_width', 'sld_camera_fov', 'sld_speaker_dist', 'sld_room_width']
@@ -1090,7 +1133,7 @@ class UpmixerWindow(QMainWindow):
         if hasattr(self, 'sld_room_amount'):
             self.sld_room_amount.setDisabled(not getattr(app, 'immersive', False) or is_stereo)
         if hasattr(self, 'sld_ai_spread'):
-            self.sld_ai_spread.setDisabled(not getattr(app, 'ai_music_mode', False) or is_stereo)
+            self.sld_ai_spread.setDisabled(not (getattr(app, 'ai_music_mode', False) or getattr(app, 'ai_live_mode', False)) or is_stereo)
         if 'immersive' in self.option_buttons:
             self.option_buttons['immersive'].setEnabled(not is_stereo)
 
@@ -1112,7 +1155,7 @@ class UpmixerWindow(QMainWindow):
         # 4. Mode-exclusive visibility
         speaker_only = ['transaural_widening', 'cinema_steering', 'gaming_panning', 'stage_equalizer', 'spectral_upmix',
                         'head_tracking', 'center_extraction', 'lfe_muted', 'vocal_lock', 'freq_dep_width',
-                        'immersive', 'hard_pan_sides', 'wide_stereo_sides', 'center_match', 'ai_music_mode']
+                        'immersive', 'hard_pan_sides', 'wide_stereo_sides', 'center_match', 'ai_music_mode', 'ai_live_mode']
         headphone_only = ['head_shadow_eq', 'headphone_tracking', 'hp_externalization']
 
         for f in speaker_only:
@@ -1295,12 +1338,27 @@ class UpmixerWindow(QMainWindow):
                 t = "AI: model ready" if model_ok(ctl.model_path) else "AI: model not downloaded (304 MB)"
             else:
                 t = ctl.status_text
+            if getattr(self.audio_app, 'ai_music_mode', False) and self.audio_app._live_requested():
+                t = "AI Music: paused while AI Live is active"
             if t != self.lbl_ai.text():
                 self.lbl_ai.setText(t)
             from ai_separation import model_ok as _mok
             self.btn_ai_download.setVisible(not _mok(ctl.model_path) and ctl.state != "downloading")
 
         self._update_adaptive_display()
+
+        if hasattr(self, 'lbl_live'):
+            from ai_live import models_present
+            ctl = getattr(self.audio_app, '_live', None)
+            text = (ctl.status_text if ctl is not None and ctl.state == 'downloading'
+                    else self.audio_app.live_status_text())
+            if text != self.lbl_live.text():
+                self.lbl_live.setText(text)
+            self.btn_live_download.setVisible(not models_present() or (ctl is not None and ctl.state == 'error'))
+            self.btn_live_download.setEnabled(ctl is None or ctl.state not in ('loading', 'downloading'))
+
+        if hasattr(self, 'lbl_enhance'):
+            self.lbl_enhance.setText(self.audio_app.enhance_status_text())
 
         if hasattr(self, 'lbl_secondary_status'):
             enabled = getattr(self.audio_app, 'secondary_output_enabled', False)

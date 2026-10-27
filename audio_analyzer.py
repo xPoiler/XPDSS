@@ -217,6 +217,7 @@ class AudioBypass:
         self.write_ptr = 0
         self.read_ptr = 0
         self.available_samples = 0
+        self._input_total_samples = 0
         self.buffer_lock = threading.Lock()
         
         # Pre-allocate for analysis
@@ -231,6 +232,7 @@ class AudioBypass:
         self._callback_error_count = 0
         self._last_callback_error = None
         self.stop_event = threading.Event()
+        self._stop_lock = threading.RLock()
         self.analysis_thread = None
         self.input_stream = None
         self.output_stream = None
@@ -447,10 +449,19 @@ class AudioBypass:
             self.console_hidden = False
 
     def stop(self, icon=None, item=None):
+        # GUI/tray shutdown sets stop_event before closing the devices. The
+        # audio worker must wait for that cleanup before releasing its COM
+        # apartment; observing stop_event alone does not mean cleanup is done.
+        with self._stop_lock:
+            self._stop_resources()
+
+    def _stop_resources(self):
         if self.stop_event.is_set():
             return
         print("Stopping application...")
         self.stop_event.set()
+        if getattr(self, '_live', None) is not None:
+            self._live.ensure(False, self.sample_rate)
         self.save_config()
         if self.tray_icon:
             try: self.tray_icon.stop()
@@ -1102,6 +1113,9 @@ class AudioBypass:
     def open_input_stream(self):
         with self.stream_lock:
             if self.input_stream: return
+            if getattr(self, '_live', None) is not None:
+                self._live.invalidate()
+            stream = None
             try:
                 # Re-allocate buffers if channel count or sample rate changed
                 with self.buffer_lock:
@@ -1117,10 +1131,12 @@ class AudioBypass:
                     self.write_ptr = 0
                     self.read_ptr = 0
                     self.available_samples = 0
+                    self._input_total_samples = 0
+                    self._live_capture_id = None
                     self._drift_fill_ema = None
                     self._in_primed = False
 
-                self.input_stream = sd.InputStream(
+                stream = sd.InputStream(
                     device=self.input_device_id,
                     samplerate=self.sample_rate,
                     blocksize=self.blocksize,
@@ -1129,9 +1145,13 @@ class AudioBypass:
                     callback=self.input_callback,
                     latency=self.latency
                 )
-                self.input_stream.start()
+                stream.start()
+                self.input_stream = stream
                 print(f"Input Stream started: {self.max_input_ch} channels")
             except Exception as e:
+                if stream is not None:
+                    try: stream.close()
+                    except Exception: pass
                 self.input_stream = None
                 print(f"Failed to open input stream: {e}")
 
@@ -1141,6 +1161,7 @@ class AudioBypass:
                 return
 
             previous_channels = self.current_channels
+            stream = None
             try:
                 # 1. Close current stream
                 if self.output_stream:
@@ -1171,6 +1192,9 @@ class AudioBypass:
                     print(f"Output Stream active: {channels} channels {mode_str}")
 
             except Exception as e:
+                if stream is not None:
+                    try: stream.close()
+                    except Exception: pass
                 self.current_channels = previous_channels
                 self.failed_channel_counts.add(channels)
                 # Fall back to Stereo if we were trying Surround
@@ -3291,6 +3315,9 @@ class AudioBypass:
     def _reset_runtime_after_format_change(self, old_rate):
         """Rebuild everything that depends on sample rate / channel layout."""
         self.failed_channel_counts.clear()
+        if getattr(self, '_live', None) is not None:
+            self._live.invalidate()
+        self._live_was_active = False
         self._reset_dsp_state()
         if int(old_rate) != int(self.sample_rate):
             for attr in ('_sub_analysis_buf', '_sub_phase_acc', '_sub_env_state', '_sub_confidence',
@@ -3463,6 +3490,28 @@ class AudioBypass:
                 if frames >= size:
                     data = data[-size:]
                     frames = size
+                # Feed Live at capture, BEFORE the ordinary input reserve.
+                # Inference overlaps buffering instead of adding another delay.
+                ctl = getattr(self, '_live', None)
+                sep = ctl.separator if ctl is not None and ctl.state == 'ready' else None
+                live_requested = self._live_requested()
+                if (live_requested or self._enhance_requested()) and sep is not None:
+                    new_separator = getattr(self, '_live_capture_id', None) != id(sep)
+                    fold = not live_requested
+                    fold_changed = getattr(self, '_live_capture_fold', fold) != fold
+                    gap = (not new_separator and
+                           self._live_capture_origin + sep.fed != self._input_total_samples)
+                    discontinuity = gap or fold_changed or bool(getattr(status, 'input_overflow', False))
+                    if new_separator or gap:
+                        self._live_capture_id = id(sep)
+                        self._live_capture_origin = self._input_total_samples - sep.fed
+                    self._live_capture_fold = fold
+                    analysis_data = data
+                    if fold:
+                        from ai_enhance import analysis_fold
+                        analysis_data = analysis_fold(data)
+                    sep.feed(analysis_data, discontinuity=discontinuity or (new_separator and sep.fed > 0))
+                self._input_total_samples += frames
                 # On overflow drop the OLDEST samples: advance the read pointer
                 # too, so (write_ptr - read_ptr) always equals available_samples.
                 overflow = max(0, self.available_samples + frames - size)
@@ -3531,6 +3580,11 @@ class AudioBypass:
         # 0. Master Bypass Mode: no DSP, but channels the output lacks are
         #    still downmixed rather than dropped.
         if getattr(self, 'bypass_all', False):
+            if getattr(self, '_live', None) is not None:
+                self._live.ensure(False, self.sample_rate)
+            self._live_was_active = False
+            self._enhance_processor = None
+            self._enhance_guidance = None
             limit = min(src_block.shape[1], out_ch)
             out_block[:, :limit] = src_block[:, :limit]
             self._downmix_extra_channels(src_block, out_block, out_ch)
@@ -3550,6 +3604,8 @@ class AudioBypass:
         # Spectral upmix engine (optional, A/B against the classic one). While
         # it is selected, passthrough is delayed by the same latency so that
         # switching between the two never jumps in time.
+        enhance = self._enhance_requested()
+        # Enhancement is independent of placement and route latency.
         spectral = self._spectral_selected(out_ch)
         if is_passthrough:
             mode = 'pass_d' if spectral else 'pass'
@@ -3557,11 +3613,20 @@ class AudioBypass:
             mode = 'spectral' if spectral else 'upmix'
         # AI music mode: once its model runs, it takes over the upmix
         ai = self._ai_controller()
-        ai.ensure(bool(getattr(self, 'ai_music_mode', False)) and not is_passthrough and out_ch > 2,
+        live = self._live_requested(out_ch)
+        ai.ensure(bool(getattr(self, 'ai_music_mode', False)) and not live and not is_passthrough and out_ch > 2,
                   self.sample_rate)
-        if not is_passthrough and out_ch > 2 and getattr(self, 'ai_music_mode', False) \
+        if not live and not is_passthrough and out_ch > 2 and getattr(self, 'ai_music_mode', False) \
                 and ai.state == "ready" and ai.separator is not None:
             mode = 'ai'
+        if live or enhance:
+            self._live_controller().ensure(True, self.sample_rate)
+        if live:
+            mode = 'live'  # fixed-delay fallback also while loading/missing/failed
+        elif not enhance and getattr(self, '_live', None) is not None:
+            self._live.ensure(False, self.sample_rate)
+        if enhance or getattr(self, '_enhance_guidance', None) is not None:
+            self._prepare_enhance(enhance)
 
         if is_passthrough and self.is_multichannel_detected:
             if self.last_mode != "PASSTHROUGH_DISCRETE":
@@ -3570,7 +3635,7 @@ class AudioBypass:
         elif is_passthrough:
             self.last_mode = "PASSTHROUGH_STEREO"
         elif self.last_mode != mode:
-            engine = {"spectral": "Spectral", "ai": "AI music"}.get(mode, "Classic")
+            engine = {"spectral": "Spectral", "ai": "AI music", "live": "AI Live"}.get(mode, "Classic")
             print(f"\n[MODE] UPMIXING ({engine} - {out_ch} ch)")
             self.last_mode = mode
 
@@ -3590,12 +3655,24 @@ class AudioBypass:
         # or the one being faded out, needs it.
         spectral_modes = ('spectral', 'pass_d')
         fade_from = getattr(self, '_route_fade_from', None)
+        if mode != 'live' and fade_from != 'live':
+            self._live_was_active = False
         if mode in spectral_modes or fade_from in spectral_modes:
             self._prepare_spectral_block(src_block, out_ch)
         elif mode != 'ai' and fade_from != 'ai':     # the AI route runs the engine itself
             self._spectral_was_active = False
 
-        self._route(mode, src_block, out_block, out_ch)
+        # Live's fallback and Classic share filter/delay state. During their
+        # crossfade, render Classic once and reuse it for both sides.
+        classic = None
+        if {mode, fade_from} == {'live', 'upmix'}:
+            cache = getattr(self, '_live_fade_classic', None)
+            if cache is None or cache.shape != out_block.shape:
+                cache = self._live_fade_classic = np.empty_like(out_block)
+            cache.fill(0)
+            self._route_upmix(src_block, cache, out_ch)
+            classic = cache
+        self._route(mode, src_block, out_block, out_ch, classic=classic)
 
         if getattr(self, '_route_fade_from', None) is not None:
             fb = getattr(self, '_route_fade_buf', None)
@@ -3604,7 +3681,7 @@ class AudioBypass:
             other = fb[:frames]
             other[:] = 0.0
             try:
-                self._route(self._route_fade_from, src_block, other, out_ch)
+                self._route(self._route_fade_from, src_block, other, out_ch, classic=classic)
             except Exception as e:
                 # A route that cannot render any more (e.g. AI mode unloaded)
                 # must not stall the fade: drop it and play the new route.
@@ -3651,6 +3728,8 @@ class AudioBypass:
         # are late by their latency (21 ms / ~1 s), and the undelayed input made
         # the synthesised sub start that much before its bass note.
         aligned_src = src_block
+        if mode == 'live':
+            aligned_src = self._live_delayed_src
         if mode in ('spectral', 'pass_d', 'ai') and getattr(self, '_spec_delayed_src', None) is not None \
                 and self._spec_delayed_src.shape[0] == frames:
             aligned_src = self._spec_delayed_src
@@ -3660,6 +3739,11 @@ class AudioBypass:
         # Phantom-matched centre (upmix only: the centre then holds moved content)
         if out_ch > 2 and not is_passthrough:
             self._apply_center_match(out_block)
+
+        # In AI Live the stems themselves are enhanced (_route_live); the mix
+        # tonal EQ then steps aside so the two never stack.
+        if enhance or getattr(self, '_enhance_processor', None) is not None:
+            self._apply_enhance(out_block, enhance and mode != 'live')
 
         # Output headroom, then the peak limiter (all channels)
         self._apply_output_headroom(out_block)
@@ -3715,7 +3799,7 @@ class AudioBypass:
         if gain != 1.0 or getattr(self, '_last_headroom', 1.0) != 1.0:
             out_block *= self._get_ramp('_last_headroom', gain, out_block.shape[0])[:, np.newaxis]
 
-    def _route(self, mode, src_block, out_block, out_ch):
+    def _route(self, mode, src_block, out_block, out_ch, classic=None):
         if mode == 'pass':
             self._route_passthrough(src_block, out_block, out_ch)
         elif mode == 'pass_d':
@@ -3724,8 +3808,174 @@ class AudioBypass:
             self._route_spectral(out_block, out_ch)
         elif mode == 'ai':
             self._route_ai(src_block, out_block, out_ch)
+        elif mode == 'live':
+            self._route_live(src_block, out_block, out_ch, classic=classic)
         else:
-            self._route_upmix(src_block, out_block, out_ch)
+            if classic is None:
+                self._route_upmix(src_block, out_block, out_ch)
+            else:
+                out_block[:] = classic
+
+    # ─── Optional AI enhancement; saved selections are never overwritten ─
+
+    def _enhance_requested(self):
+        return bool(getattr(self, 'ai_enhance', False)) and not self.bypass_all
+
+    def _prepare_enhance(self, enabled):
+        ctl = getattr(self, '_live', None)
+        sep = ctl.separator if ctl is not None and ctl.state == 'ready' else None
+        if enabled:
+            identity = (id(sep), self.sample_rate)
+            if (getattr(self, '_enhance_guidance', None) is None or
+                    getattr(self, '_enhance_identity', None) != identity):
+                from ai_enhance import EnhanceGuidance
+                self._enhance_guidance = EnhanceGuidance()
+                self._enhance_identity = identity
+            if sep is not None:
+                sep.enhance_guidance = self._enhance_guidance
+        else:
+            if sep is not None:
+                sep.enhance_guidance = None
+            self._enhance_guidance = None
+
+    def _apply_enhance(self, block, enabled):
+        from ai_live import SUPPORTED_RATES
+        if self.sample_rate not in SUPPORTED_RATES:
+            self._enhance_processor = None
+            return
+        processor = getattr(self, '_enhance_processor', None)
+        if processor is None or (processor.rate, processor.channels) != (self.sample_rate, block.shape[1]):
+            if not enabled:
+                self._enhance_processor = None
+                return
+            from ai_enhance import EnhanceProcessor
+            processor = self._enhance_processor = EnhanceProcessor(self.sample_rate, block.shape[1])
+        block[:] = processor.process(block, getattr(self, '_enhance_guidance', None), enabled)
+        if not enabled and processor.wet == 0:
+            self._enhance_processor = None
+
+    def _enhance_stems(self, stems):
+        enabled = self._enhance_requested()
+        enhancer = getattr(self, '_stem_enhancer', None)
+        if enhancer is None or enhancer.rate != self.sample_rate:
+            if not enabled:
+                self._stem_enhancer = None
+                return stems
+            from ai_enhance import StemEnhancer
+            enhancer = self._stem_enhancer = StemEnhancer(self.sample_rate)
+        stems = enhancer.process(stems, getattr(self, 'ai_enhance_amount', .7), enabled)
+        if not enabled and enhancer.wet == 0:
+            self._stem_enhancer = None
+        return stems
+
+    def enhance_status_text(self):
+        if not getattr(self, 'ai_enhance', False):
+            return 'AI Enhance: off'
+        if self.bypass_all:
+            return 'AI Enhance: paused by master bypass'
+        ctl = getattr(self, '_live', None)
+        state = ctl.state if ctl is not None else 'loading'
+        guidance = getattr(self, '_enhance_guidance', None)
+        if state != 'ready':
+            return {'missing': 'AI Enhance: download the Live model below',
+                    'error': 'AI Enhance: unavailable — normal processing',
+                    'downloading': 'AI Enhance: downloading model…'}.get(state, 'AI Enhance: preparing…')
+        if guidance is None or guidance.error or time.monotonic()-guidance.snapshot[0] > .5:
+            return 'AI Enhance: waiting for fresh analysis — neutral'
+        if getattr(self, '_route_mode', None) == 'live':
+            return 'AI Enhance: stem remaster on AI Live · no added latency'
+        return 'AI Enhance: tonal balance (turn on AI Live for full stem remaster)'
+
+    # ─── AI Live (all policy changes are conditional on this route) ─────
+
+    def _live_requested(self, out_ch=None):
+        channels = out_ch if out_ch is not None else (self.current_channels or self.max_output_ch)
+        return (bool(getattr(self, 'ai_live_mode', False)) and self.upmix_enabled
+                and not self.bypass_all and channels > 2
+                and not (self.is_multichannel_detected and not self.manual_upmix))
+
+    def _live_controller(self):
+        ctl = getattr(self, '_live', None)
+        if ctl is None:
+            from ai_live import LiveController
+            ctl = self._live = LiveController()
+        return ctl
+
+    def _route_live(self, src_block, out_block, out_ch, classic=None):
+        frames = len(src_block)
+        if not getattr(self, '_live_was_active', False):
+            from ai_live import LiveDezipper
+            self._last_live_mix = 0.0
+            self._live_dezipper = LiveDezipper(self.sample_rate)
+            self._live_was_active = True
+        delayed = self._live_delayed_src = src_block
+        # Classic processing contributes no spectral lookahead. Effects and
+        # bass are still rendered on the very same delayed audio timeline.
+        if classic is None:
+            self._route_upmix(delayed, out_block, out_ch)
+        else:
+            out_block[:] = classic
+        stems = getattr(self, '_live_stems', None)
+        valid = getattr(self, '_live_valid', None)
+        self._live_stems = None  # consume only this block's aligned result
+        self._live_valid = None
+        if stems is None:
+            # Never repeat old audio to cover a missed deadline.
+            self._last_live_mix = 0.0
+            self._live_dezipper.process(out_block, False)
+            return
+        mix = delayed[:, :2].T
+        residual = mix - stems.sum(axis=0)
+        stems = self._enhance_stems(stems)
+        drums, bass, other, vocals = stems
+        v_mid = (vocals[0]+vocals[1])*.5
+        v_side = (vocals[0]-vocals[1])*.5
+        spread = float(np.clip(self.ai_instrument_spread, 0, 1))*math.pi*.375
+        cs, sn = math.cos(spread), math.sin(spread)
+        g = self.CLASSIC_MATCH_GAIN
+        fl = (drums[0]+bass[0]+residual[0]+v_side+cs*other[0])*g
+        fr = (drums[1]+bass[1]+residual[1]-v_side+cs*other[1])*g
+        if self.center_extraction:
+            center = math.sqrt(2)*v_mid*g*(.707 if self.stage_equalizer else 1.0)
+        else:
+            center = np.zeros(frames, np.float32)
+            fl += v_mid*g
+            fr += v_mid*g
+        from ai_live import live_mix_envelope
+        if valid is None:
+            valid = np.ones(frames, dtype=bool)
+        previous_mix = self._last_live_mix
+        r = live_mix_envelope(valid, previous_mix, self._live_dezipper.length)
+        self._last_live_mix = float(r[-1])
+        out_block[:, 0] = out_block[:, 0]*(1-r)+fl*r
+        out_block[:, 1] = out_block[:, 1]*(1-r)+fr*r
+        out_block[:, 2] = out_block[:, 2]*(1-r)+center*r
+        if out_ch >= 6:
+            left, right = (6, 7) if out_ch >= 8 else (4, 5)
+            gain = 10**(self.side_gain_db/20)*g
+            out_block[:, left] += sn*other[0]*r*gain
+            out_block[:, right] += sn*other[1]*r*gain
+        self._live_dezipper.process(out_block, r[0] > 0, r[-1] > 0,
+                                   discontinuity=r[0] < previous_mix-1e-6)
+
+    def live_status_text(self):
+        if not getattr(self, 'ai_live_mode', False):
+            return 'AI Live: off'
+        if not self._live_requested():
+            return 'AI Live: standby — requires stereo input, upmix on and surround output'
+        ctl = getattr(self, '_live', None)
+        status = ctl.status_text if ctl else 'AI Live: waiting for audio'
+        # PortAudio reports driver buffers, not VB-Cable source or receiver delay.
+        try:
+            driver_ms = 1000*(self.input_stream.latency+self.output_stream.latency)
+            reserve_ms = 1000*self.target_latency_samples/self.sample_rate
+            estimate = driver_ms+reserve_ms+1.5+(127000/self.sample_rate if self.spectral_tilt else 0)
+            status += f' · estimated path {estimate:.0f} ms (excludes source/receiver)'
+            if round(estimate) > 65:
+                status += ' — over ~65 ms target'
+        except (AttributeError, TypeError):
+            status += ' · total latency unmeasured'
+        return status
 
     # ─── AI music mode ──────────────────────────────────────────────────
 
@@ -4318,7 +4568,21 @@ class AudioBypass:
                 out_block[:, 4], out_block[:, 5] = sides
         self._immersive_room((L + R) * 0.5, out_ch, out_block)
 
-    def _read_input_block(self, frames):
+    def _live_wait_budget(self, frames, time_info=None):
+        if not self._live_requested():
+            return 0.0
+        period = frames / float(self.sample_rate)
+        budget = min(.005, period*.5)
+        if time_info is not None:
+            try:
+                slack = float(time_info.outputBufferDacTime-time_info.currentTime)
+                # Leave at least half a callback period for the existing DSP.
+                budget = min(budget, max(0.0, slack-period*.5))
+            except (AttributeError, TypeError):
+                budget = 0.0
+        return budget
+
+    def _read_input_block(self, frames, live_wait_s=None):
         """Pull `frames` samples from the input ring buffer (None on underrun).
 
         Applies clock-drift compensation: when the fill level drifts away
@@ -4326,7 +4590,23 @@ class AudioBypass:
         block is resampled back to `frames` (inaudible, unlike the hard
         skips/dropouts a drifting virtual cable otherwise causes).
         """
+        read_started = time.perf_counter()
+        live_pull = None
         with self.buffer_lock:
+            live = self._live_requested()
+            self._live_stems = None
+            self._live_valid = None
+            previous = getattr(self, '_live_buffer_previous', None)
+            if live:
+                from ai_live import LIVE_RESERVE_MS
+                if previous is None:
+                    self._live_buffer_previous = (self.sample_rate, self.target_latency_samples)
+                    self._in_primed = False  # trim an existing adaptive reserve immediately
+                self.target_latency_samples = int(self.sample_rate*LIVE_RESERVE_MS/1000)
+            elif previous is not None:
+                self.target_latency_samples = previous[1] if previous[0] == self.sample_rate else int(self.sample_rate*.010)
+                self._live_buffer_previous = None
+                self._in_primed = False
             size = self.ring_buffer_size
             ch = self.buffer.shape[1]
             target = self.target_latency_samples
@@ -4334,7 +4614,7 @@ class AudioBypass:
             # Hard resync after a long stall (stream restart, overflow): jump to
             # the newest audio BEFORE reading, so no stale block is played.
             excess = self.available_samples - frames - target
-            if excess > max(2048, 4 * frames):
+            if excess > max(2048, 4 * frames) or (live and not self._in_primed and excess > 0):
                 self.io_stats['resync'] += 1
                 self.read_ptr = (self.read_ptr + excess) % size
                 self.available_samples -= excess
@@ -4355,7 +4635,7 @@ class AudioBypass:
             if self.available_samples < n_in:
                 # Underrun: the input arrived late. Grow the reserve and re-prime.
                 self.io_stats['buffer_empty'] += 1
-                self.target_latency_samples = min(self._target_max_samples,
+                self.target_latency_samples = min(int(self.sample_rate*LIVE_RESERVE_MS/1000) if live else self._target_max_samples,
                                                   target + int(self.sample_rate * 0.005))
                 self._in_primed = False
                 return None
@@ -4365,8 +4645,34 @@ class AudioBypass:
             raw = self._src_blk_pre[:n_in, :ch]
             self._ring_read(self.buffer, self.read_ptr, n_in, raw)
 
+            if live:
+                ctl = getattr(self, '_live', None)
+                sep = ctl.separator if ctl is not None and ctl.state == 'ready' else None
+                if sep is not None and getattr(self, '_live_capture_id', None) == id(sep):
+                    start = self._input_total_samples - self.available_samples - self._live_capture_origin
+                    live_pull = (sep, start)
+
             self.read_ptr = (self.read_ptr + n_in) % size
             self.available_samples -= n_in
+
+        # Never hold the capture lock while allowing in-flight inference to
+        # finish: the next capture must remain free to arrive and feed it.
+        if live_pull is not None:
+            sep, start = live_pull
+            budget = self._live_wait_budget(frames) if live_wait_s is None else live_wait_s
+            budget = max(0.0, budget-(time.perf_counter()-read_started))
+            result = sep.pull_available(start, n_in, wait_s=budget)
+            if result is not None:
+                stems, valid = result
+                if n_in != frames:
+                    flat = stems.transpose(2, 0, 1).reshape(n_in, 8)
+                    converted = self._resample_block(flat, frames, np.empty((frames, 8), np.float32))
+                    stems = converted.reshape(frames, 4, 2).transpose(1, 2, 0)
+                    positions = np.arange(frames)*(n_in/frames)
+                    indices = np.floor(positions).astype(int)
+                    valid = valid[indices] & valid[np.minimum(indices+1, n_in-1)]
+                self._live_stems = stems
+                self._live_valid = valid
 
         if adj == 0:
             return raw
@@ -4384,7 +4690,7 @@ class AudioBypass:
         # good, so every failure is caught here and the block is silenced.
         t0 = time.perf_counter()
         try:
-            src_block = self._read_input_block(frames)
+            src_block = self._read_input_block(frames, live_wait_s=self._live_wait_budget(frames, time_info))
             if src_block is None:
                 outdata.fill(0)
                 return
@@ -4398,19 +4704,26 @@ class AudioBypass:
             self._report_callback_error("output", e)
 
     def _check_stream_health(self):
-        """Reopen streams that PortAudio stopped (device unplugged, driver reset...)."""
+        """Retry failed opens as well as streams stopped by a driver reset."""
         if not self.stream_lock.acquire(blocking=False):
             return  # a device change / calibration is in progress
         try:
-            if self.input_stream is not None and not self.input_stream.active:
-                print("[Stream] Input stream stopped unexpectedly, reopening...")
-                try: self.input_stream.close()
-                except Exception: pass
+            if self.stop_event.is_set() or self.simulation:
+                return
+            if self.input_stream is None or not self.input_stream.active:
+                print("[Stream] Input stream unavailable, reopening...")
+                if self.input_stream is not None:
+                    try: self.input_stream.close()
+                    except Exception: pass
                 self.input_stream = None
                 self.open_input_stream()
-            if self.output_stream is not None and not self.output_stream.active:
-                print("[Stream] Output stream stopped unexpectedly, reopening...")
-                self.open_output_stream(self.current_channels or self.max_output_ch)
+            if self.output_stream is None or not self.output_stream.active:
+                print("[Stream] Output stream unavailable, reopening...")
+                # A startup/driver failure is not proof that a layout is
+                # unsupported. Retry on this two-second health tick, while
+                # preserving the failure cache when stereo is working.
+                self.failed_channel_counts.clear()
+                self.open_output_stream(self.max_output_ch)
             if self.secondary_output_stream is not None and not self.secondary_output_stream.active:
                 print("[Stream] Secondary output stopped unexpectedly, reopening...")
                 self.refresh_secondary_output_stream()
@@ -4420,6 +4733,25 @@ class AudioBypass:
             self.stream_lock.release()
 
     def run(self):
+        # WASAPI needs COM on the thread opening/starting the streams. The
+        # main thread's initialization (taskbar/Qt) does not cover this audio
+        # worker; without it start() can fail until the GUI applies devices.
+        com_initialized = False
+        try:
+            if IS_WINDOWS and not self.simulation:
+                hr = ctypes.windll.ole32.CoInitializeEx(None, 0)  # COINIT_MULTITHREADED
+                com_initialized = hr in (0, 1)  # S_OK or S_FALSE both need balancing
+                if not com_initialized and hr != -2147417850:  # RPC_E_CHANGED_MODE
+                    raise RuntimeError(f"Audio thread COM initialization failed: 0x{hr & 0xffffffff:08X}")
+            self._run_audio_loop()
+        finally:
+            try:
+                self.stop()
+            finally:
+                if com_initialized:
+                    ctypes.windll.ole32.CoUninitialize()
+
+    def _run_audio_loop(self):
         print(f"Monitoring '{self.input_name}' -> '{self.output_name}'")
 
         # Start analysis thread
